@@ -339,6 +339,9 @@ class PurchaseOrderLine(Base):
     received_qty: Mapped[float] = mapped_column(Float, default=0)
     rate: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     amount: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
+    uom: Mapped[str] = mapped_column(String(30), default="")
+    tax_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     po: Mapped[PurchaseOrder] = relationship(back_populates="lines")
     product: Mapped[Product | None] = relationship()

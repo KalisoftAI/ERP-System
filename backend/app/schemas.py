@@ -199,6 +199,12 @@ class RawMaterialBalanceOut(ORMModel):
     product: Optional[ProductOut] = None
 
 
+class RawMaterialStockSet(BaseModel):
+    """Set physical current stock (Main Store) via the stock-movement pipeline."""
+    current_stock: float
+    remarks: str = ""
+
+
 # ------------------------- Purchases -------------------------
 class PurchaseOrderLineIn(BaseModel):
     product_id: Optional[int] = None
@@ -208,6 +214,9 @@ class PurchaseOrderLineIn(BaseModel):
     received_qty: float = 0
     rate: Optional[float] = None
     amount: Optional[float] = None
+    uom: str = ""
+    tax_percent: Optional[float] = None
+    discount_percent: Optional[float] = None
 
 
 class PurchaseOrderCreate(BaseModel):
@@ -239,6 +248,9 @@ class PurchaseOrderLineOut(ORMModel):
     received_qty: float
     rate: Optional[float]
     amount: Optional[float]
+    uom: str = ""
+    tax_percent: Optional[float]
+    discount_percent: Optional[float]
     product: Optional[ProductOut] = None
 
 

@@ -34,6 +34,9 @@ _COLUMN_MIGRATIONS = [
     ("customer_dispatches", "customer_name", "VARCHAR(255)"),
     ("bill_of_materials", "bom_id", "INTEGER"),
     ("plans", "sales_order_id", "INTEGER"),
+    ("purchase_order_lines", "uom", "VARCHAR(30) DEFAULT ''"),
+    ("purchase_order_lines", "tax_percent", "DOUBLE PRECISION"),
+    ("purchase_order_lines", "discount_percent", "DOUBLE PRECISION"),
 ]
 
 # Internal stock locations seeded as Plants (Main Store = plant_id NULL).

@@ -20,10 +20,13 @@ def list_products(
     _: CurrentUser,
     search: str = "",
     category: str = "",
+    include_inactive: bool = Query(False, description="Also list deactivated products"),
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=500),
 ):
     stmt = select(Product)
+    if not include_inactive:
+        stmt = stmt.where(Product.is_active.is_(True))
     if search:
         like = f"%{search}%"
         stmt = stmt.where(or_(Product.model.ilike(like), Product.item_code.ilike(like), Product.name.ilike(like)))

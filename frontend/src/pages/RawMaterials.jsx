@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  Plus, Pencil, Trash2, Eye, Search, Download, RefreshCw,
+  Plus, Pencil, Trash2, Eye, Search, Download, RefreshCw, Package,
   AlertTriangle, CheckCircle2, Boxes, ArrowDownToLine, ClipboardList,
 } from 'lucide-react'
 import api, { downloadFile } from '../lib/api'
@@ -31,7 +31,7 @@ export default function RawMaterials() {
   const [items, setItems] = useState([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
-  const [modal, setModal] = useState(null) // null | 'form' | 'balance' | 'view'
+  const [modal, setModal] = useState(null)
   const [editing, setEditing] = useState(false)
   const [form, setForm] = useState(emptyForm)
   const [balance, setBalance] = useState({})
@@ -39,17 +39,28 @@ export default function RawMaterials() {
   const [err, setErr] = useState(null)
   const [msg, setMsg] = useState(null)
   const [saving, setSaving] = useState(false)
+  const [openingStock, setOpeningStock] = useState('')
+  const [showInactive, setShowInactive] = useState(false)
+  const [stockModal, setStockModal] = useState(null)
+  const [stockValue, setStockValue] = useState('')
+  const [stockRemarks, setStockRemarks] = useState('')
+  const [stockBusy, setStockBusy] = useState(false)
+  const [stockErr, setStockErr] = useState(null)
+  const [showImport, setShowImport] = useState(false)
+  const [importFile, setImportFile] = useState(null)
+  const [importResult, setImportResult] = useState(null)
+  const [importBusy, setImportBusy] = useState(false)
 
   const load = () => {
     setLoading(true)
-    api.get('/raw-materials', { params: { search } })
+    api.get('/raw-materials', { params: { search, include_inactive: showInactive } })
       .then((res) => setItems(res.data.items))
       .catch(() => setItems([]))
       .finally(() => setLoading(false))
   }
 
   useEffect(load, [])
-  useEffect(() => { const t = setTimeout(load, 300); return () => clearTimeout(t) }, [search])
+  useEffect(() => { const t = setTimeout(load, 300); return () => clearTimeout(t) }, [search, showInactive])
 
   const notify = (text, isErr = false) => {
     if (isErr) { setMsg(null); setErr(text); return }
@@ -57,8 +68,7 @@ export default function RawMaterials() {
     setTimeout(() => setMsg(null), 3000)
   }
 
-  // ---------------- Raw Material master CRUD ----------------
-  const openNew = () => { setEditing(false); setForm({ ...emptyForm }); setErr(null); setModal('form') }
+  const openNew = () => { setEditing(false); setForm({ ...emptyForm }); setOpeningStock(''); setErr(null); setModal('form') }
   const openEdit = (row) => { setEditing(true); setForm(masterFields(row)); setErr(null); setModal('form') }
 
   const openView = async (row) => {
@@ -89,10 +99,13 @@ export default function RawMaterials() {
         await api.patch(`/raw-materials/${form.id}`, payload)
         notify('Raw material updated')
       } else {
-        await api.post('/raw-materials', payload)
+        const { data: product } = await api.post('/raw-materials', payload)
         notify('Raw material added')
+        if (openingStock && product.id) {
+          await api.post(`/raw-materials/${product.id}/stock`, { current_stock: Number(openingStock) })
+        }
       }
-      setModal(null)
+      setModal(null); setOpeningStock('')
       load()
     } catch (e2) {
       notify(e2.response?.data?.detail || 'Save failed', true)
@@ -104,15 +117,18 @@ export default function RawMaterials() {
   const remove = async (row) => {
     if (!window.confirm(`Delete raw material "${row.model}"?\n\nThis will permanently remove the master record.`)) return
     try {
-      await api.delete(`/raw-materials/${row.id}`)
-      notify('Raw material deleted')
+      const res = await api.delete(`/raw-materials/${row.id}`)
+      if (res.status === 200 && res.data?.deactivated) {
+        notify(`Material deactivated (${res.data.modules?.join(', ')})`)
+      } else {
+        notify('Raw material deleted')
+      }
       load()
     } catch (e2) {
       notify(e2.response?.data?.detail || 'Delete failed', true)
     }
   }
 
-  // ---------------- Balance update ----------------
   const openBalance = (row) => {
     setErr(null)
     setBalance(row
@@ -160,7 +176,12 @@ export default function RawMaterials() {
 
   const columns = [
     { key: 'item_code', label: 'Item Code', render: (r) => <span className="font-mono text-xs">{r.item_code || '—'}</span> },
-    { key: 'model', label: 'Material', render: (r) => <span className="font-medium">{r.model}</span> },
+    { key: 'model', label: 'Material', render: (r) => (
+      <span className="flex items-center gap-1.5">
+        <span className={`font-medium ${r.is_active === false ? 'opacity-50' : ''}`}>{r.model}</span>
+        {r.is_active === false && <Badge className="bg-gray-100 text-gray-500">Inactive</Badge>}
+      </span>
+    )},
     { key: 'uom', label: 'UOM', render: (r) => r.uom || 'Each' },
     { key: 'schedule', label: 'Schedule', render: (r) => fmtNum(r.balance?.schedule_qty) },
     { key: 'inward', label: 'Inward Qty', render: (r) => fmtNum(r.balance?.inward_qty) },
@@ -180,6 +201,7 @@ export default function RawMaterials() {
           <button onClick={() => openView(r)} className="btn btn-ghost p-1.5" title="View"><Eye size={15} /></button>
           <button onClick={() => openEdit(r)} className="btn btn-ghost p-1.5" title="Edit"><Pencil size={15} /></button>
           <button onClick={() => openBalance(r)} className="btn btn-ghost p-1.5" title="Update Balance"><ClipboardList size={15} /></button>
+          <button onClick={() => { setStockModal(r); setStockValue(String(r.current_stock ?? '')); setStockRemarks('') }} className="btn btn-ghost p-1.5 text-purple-600 hover:text-purple-800" title="Set current stock"><Package size={15} /></button>
           <button onClick={() => remove(r)} className="btn btn-ghost p-1.5 text-red-400" title="Delete"><Trash2 size={15} /></button>
         </div>
       ),
@@ -197,6 +219,7 @@ export default function RawMaterials() {
             <button onClick={() => downloadFile('/reports/raw-materials/csv', 'raw_materials.csv')} className="btn btn-secondary"><Download size={15} /> CSV</button>
             <button onClick={load} className="btn btn-secondary"><RefreshCw size={15} /> Refresh</button>
             <button onClick={() => openBalance(null)} className="btn btn-secondary"><ClipboardList size={15} /> Update Balance</button>
+            <button onClick={() => setShowImport(true)} className="btn btn-secondary"><ArrowDownToLine size={15} /> Import</button>
             <button onClick={openNew} className="btn btn-primary"><Plus size={15} /> Add Raw Material</button>
           </>
         } />
@@ -211,15 +234,20 @@ export default function RawMaterials() {
       </div>
 
       <Card actions={
-        <div className="relative">
-          <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search material…" className="input input-icon sm:w-64" />
+        <div className="flex items-center gap-3">
+          <div className="relative">
+            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search material…" className="input input-icon sm:w-64" />
+          </div>
+          <label className="flex items-center gap-1.5 text-sm text-gray-500">
+            <input type="checkbox" className="rounded" checked={showInactive} onChange={e => setShowInactive(e.target.checked)} />
+            Include inactive
+          </label>
         </div>
       }>
         {loading ? <Loading /> : items.length === 0 ? <Empty text="No raw materials yet — click &quot;Add Raw Material&quot; to create your first one." /> : <Table columns={columns} data={items} keyField="id" stickyColumns={['model']} dense />}
       </Card>
 
-      {/* Add / Edit material */}
       {modal === 'form' && (
         <Modal open title={editing ? 'Edit Raw Material' : 'Add Raw Material'} onClose={() => setModal(null)} wide
           footer={<>
@@ -232,11 +260,14 @@ export default function RawMaterials() {
             {field('UOM', 'uom', { placeholder: 'e.g. KG' })}
             {field('MIN Stock Level', 'min_stock_level', { type: 'number', min: '0', step: 'any' })}
             <div className="md:col-span-2">{field('Name / Description', 'name', { placeholder: 'Optional description' })}</div>
+            <div className="space-y-1">
+              <label className="text-xs text-gray-500 font-medium uppercase tracking-wide">Current Stock (optional)</label>
+              <input type="number" className="input text-lg font-semibold py-3" value={openingStock} onChange={e => setOpeningStock(e.target.value)} placeholder="0" min="0" step="0.01" />
+            </div>
           </form>
         </Modal>
       )}
 
-      {/* Update Balance */}
       {modal === 'balance' && (
         <Modal open title="Update Raw Material Balance" onClose={() => setModal(null)}
           footer={<>
@@ -277,7 +308,6 @@ export default function RawMaterials() {
         </Modal>
       )}
 
-      {/* View detail */}
       {modal === 'view' && view && (
         <Modal open title={view.model || 'Raw Material'} subtitle={view.item_code ? `Item Code: ${view.item_code}` : ''} onClose={() => setModal(null)}>
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6">
@@ -308,6 +338,73 @@ export default function RawMaterials() {
             </div>
           </div>
         </Modal>
+      )}
+
+      {stockModal && (
+        <div className="modal-overlay" onClick={() => setStockModal(null)}>
+          <div className="modal-panel p-5" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-bold mb-1">{stockModal.model}</h3>
+            <p className="text-gray-500 text-sm mb-4">Set current stock (Main Store)</p>
+            <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Current Stock</label>
+            <input type="number" className="input text-2xl font-bold py-3 w-full mb-4" value={stockValue} onChange={e => setStockValue(e.target.value)} min="0" step="0.01" />
+            <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Remarks (optional)</label>
+            <input type="text" className="input mb-4" value={stockRemarks} onChange={e => setStockRemarks(e.target.value)} placeholder="Reason for adjustment..." />
+            {stockErr && <div className="text-red-500 text-sm mb-2">{stockErr}</div>}
+            <div className="flex gap-2">
+              <button onClick={async () => {
+                setStockBusy(true); setStockErr(null)
+                try {
+                  const { data } = await api.post(`/raw-materials/${stockModal.id}/stock`, { current_stock: Number(stockValue), remarks: stockRemarks })
+                  notify(`Stock set: ${data.previous_stock} → ${data.current_stock} (delta ${data.delta})`)
+                  setStockModal(null); load()
+                } catch (e) { setStockErr(e.response?.data?.detail || 'Update failed') }
+                finally { setStockBusy(false) }
+              }} className="btn btn-primary" disabled={stockBusy}>
+                {stockBusy ? 'Saving…' : 'Update Stock'}
+              </button>
+              <button onClick={() => setStockModal(null)} className="btn btn-secondary">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showImport && (
+        <div className="modal-overlay" onClick={() => setShowImport(null)}>
+          <div className="modal-panel p-5 max-w-lg" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-bold mb-4">Import Raw Materials</h3>
+            <p className="text-sm text-gray-500 mb-4">
+              CSV or Excel. Required column: Model (or Material/Item Name).
+              Optional: Item Code, Schedule Qty, Inward Qty, % COMP, MIN STOCK, MAX STOCK.
+            </p>
+            <input type="file" accept=".csv,.xlsx,.xls" className="input mb-4" onChange={e => setImportFile(e.target.files?.[0])} />
+            {importResult && (
+              <div className="bg-gray-50 rounded-lg p-4 mb-4 text-sm">
+                <p className="font-bold mb-1">Results</p>
+                <p>Created: {importResult.summary.created}, Updated: {importResult.summary.updated}, Errors: {importResult.summary.errors}</p>
+                {importResult.errors.length > 0 && (
+                  <ul className="mt-2 text-red-600 text-xs max-h-40 overflow-auto">
+                    {importResult.errors.map((e, i) => <li key={i}>Row {e.row}: {e.message}</li>)}
+                  </ul>
+                )}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <button onClick={async () => {
+                if (!importFile) return
+                const fd = new FormData(); fd.append('file', importFile)
+                setImportBusy(true)
+                try {
+                  const { data } = await api.post('/raw-materials/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+                  setImportResult(data); load()
+                } catch (e) { alert(e.response?.data?.detail || 'Import failed') }
+                finally { setImportBusy(false) }
+              }} className="btn btn-primary" disabled={importBusy}>
+                {importBusy ? 'Importing…' : 'Import'}
+              </button>
+              <button onClick={() => { setShowImport(null); setImportResult(null); setImportFile(null) }} className="btn btn-secondary">Close</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
