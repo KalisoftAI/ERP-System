@@ -29,9 +29,22 @@ _STATUS_MAP = {
     "Stock Transfer Required": OrderStatus.confirmed,
     "Purchase / Stock Required": OrderStatus.confirmed,
     "Production Required": OrderStatus.in_production,
+    "Production Completed": OrderStatus.production_completed,
     "Partially Dispatched": OrderStatus.dispatched,
     "Completed": OrderStatus.completed,
     "Cancelled": OrderStatus.cancelled,
+}
+
+# Reverse map: OrderStatus value → friendly label for manual status.
+_STATUS_LABEL_REVERSE = {
+    OrderStatus.new: "New",
+    OrderStatus.confirmed: "Purchase / Stock Required",
+    OrderStatus.in_production: "Production Required",
+    OrderStatus.production_completed: "Production Completed",
+    OrderStatus.ready: "Ready for Dispatch",
+    OrderStatus.dispatched: "Partially Dispatched",
+    OrderStatus.completed: "Completed",
+    OrderStatus.cancelled: "Cancelled",
 }
 
 
@@ -167,6 +180,11 @@ def friendly_status(db: Session, o: SalesOrder, dmap: tuple | None = None,
         return "Completed"
     if total > 0:
         return "Partially Dispatched"
+    # Manual gate: once the user has marked production as completed the order
+    # stays in that state until real dispatch moves it on. Production/stock
+    # changes never auto-advance it (the user stays in control).
+    if o.status == OrderStatus.production_completed:
+        return "Production Completed"
     ck = ready if ready is not None else check_ready(db, o)
     if ck["ready"]:
         return "Ready for Dispatch"
@@ -255,6 +273,7 @@ def serialize_local_order(db: Session, o: SalesOrder) -> dict:
             "model": ln.product.model if ln.product else (ln.description or ""),
             "item_code": ln.product.item_code if ln.product else "",
             "description": ln.description or (ln.product.model if ln.product else ""),
+            "uom": ln.uom or (ln.product.uom if ln.product else ""),
             "quantity": float(ln.quantity or 0),
             "rate": float(ln.unit_price) if ln.unit_price is not None else None,
             "less": float(ln.less) if ln.less is not None else None,
@@ -274,6 +293,8 @@ def serialize_local_order(db: Session, o: SalesOrder) -> dict:
         "customer_id": o.customer_id,
         "customer": customer.name if customer else (o.customer_name or None),
         "customer_name": o.customer_name or (customer.name if customer else ""),
+        "customer_mobile": customer.phone if customer else "",
+        "customer_email": customer.email if customer else "",
         "order_type": normalize_local_type(o.local_order_type),
         "order_date": o.order_date,
         "delivery_date": o.required_delivery_date,

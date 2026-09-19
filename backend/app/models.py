@@ -56,10 +56,14 @@ class OrderStatus(str, enum.Enum):
     new = "New"
     confirmed = "Confirmed"
     in_production = "In Production"
+    production_completed = "Production Completed"
     ready = "Ready"
     dispatched = "Dispatched"
     completed = "Completed"
     cancelled = "Cancelled"
+    partially_dispatched = "Partially Dispatched"
+    ready_for_dispatch = "Ready for Dispatch"
+    purchase_required = "Purchase / Stock Required"
 
 
 class ProductionStatus(str, enum.Enum):
@@ -573,6 +577,7 @@ class SalesOrderLine(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     item_code: Mapped[str] = mapped_column(String(120), default="", index=True)
     quantity: Mapped[float] = mapped_column(Float, default=0)
+    uom: Mapped[str] = mapped_column(String(30), default="")
     customer_po_no: Mapped[str] = mapped_column(String(120), default="")
     unit_price: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     less: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)

@@ -63,7 +63,7 @@ const TITLE_MAP = {
   '/': { title: 'Dashboard', sub: 'Business overview' },
   '/orders': { title: 'Orders', sub: 'Sales orders & pipeline' },
   '/dispatch': { title: 'Dispatch', sub: 'Customer-wise dispatch tracking' },
-  '/production': { title: 'Production', sub: 'Plan vs actual production' },
+  '/production': { title: 'Production', sub: 'Schedule, actual output & reports' },
   '/local-orders': { title: 'Local Orders', sub: 'Local orders & plans' },
   '/pending-po': { title: 'Pending PO', sub: 'Order fulfilment ledger' },
   '/raw-materials': { title: 'Raw Materials', sub: 'Polymer position & balances' },

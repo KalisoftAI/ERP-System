@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { Plus, Eye, Pencil, X, Store, ClipboardList, CheckCircle2, Trash2, Truck, Calendar, PackageSearch, ArrowLeftRight, Factory } from 'lucide-react'
-import api from '../lib/api'
+import { Plus, Eye, Pencil, X, Store, ClipboardList, CheckCircle2, Trash2, Truck, Calendar, PackageSearch, ArrowLeftRight, Upload, Share2, Printer, Download } from 'lucide-react'
+import api, { downloadFile } from '../lib/api'
 import { PageHeader, Card, Modal, Loading, Empty, Badge, StatCard, StatusBadge, SearchSelect } from '../components/ui'
 import Table from '../components/Table'
 import StockTransferModal, { findDispatchPlant } from '../components/StockTransferModal'
@@ -9,7 +8,7 @@ import { fmtNum } from '../lib/format'
 
 const today = () => new Date().toISOString().slice(0, 10)
 
-const emptyLine = { product_id: null, item_code: '', description: '', quantity: 1, unit_price: null, less: null, id: null }
+const emptyLine = { product_id: null, item_code: '', description: '', quantity: 1, uom: '', unit_price: null, less: null, id: null }
 
 const errText = (err) => {
   const d = err?.response?.data?.detail
@@ -19,8 +18,8 @@ const errText = (err) => {
 }
 
 export default function LocalOrders() {
-  const navigate = useNavigate()
   const [rows, setRows] = useState([])
+  const [completedTotal, setCompletedTotal] = useState(0)
   const [plans, setPlans] = useState([])
   const [loading, setLoading] = useState(true)
   const [customers, setCustomers] = useState([])
@@ -32,6 +31,12 @@ export default function LocalOrders() {
   const [form, setForm] = useState({})
   const [errors, setErrors] = useState({})
   const [saving, setSaving] = useState(false)
+
+  // bulk import state
+  const [showImport, setShowImport] = useState(false)
+  const [importFile, setImportFile] = useState(null)
+  const [importResult, setImportResult] = useState(null)
+  const [importBusy, setImportBusy] = useState(false)
 
   // dispatch entry state
   const [showEntry, setShowEntry] = useState(false)
@@ -49,12 +54,13 @@ export default function LocalOrders() {
 
   const flash = (text) => { setSuccess(text); setTimeout(() => setSuccess(''), 6000) }
 
-  const goToProduction = (orderId) => navigate(`/production?order=${orderId}`)
-
   const load = () => {
     setLoading(true)
-    api.get('/local-orders', { params: { page_size: 500 } })
-      .then((res) => setRows(res.data.items || []))
+    api.get('/local-orders', { params: { page_size: 500, active_only: true } })
+      .then((res) => {
+        setRows(res.data.items || [])
+        setCompletedTotal(res.data.completed_total || 0)
+      })
       .catch(() => setRows([]))
       .finally(() => setLoading(false))
   }
@@ -75,6 +81,14 @@ export default function LocalOrders() {
       setLocations(locs)
       setDispatchPlantId(findDispatchPlant(locs))
     }).catch(() => {})
+    const focus = new URLSearchParams(window.location.search).get('order')
+    if (focus && Number(focus)) {
+      setDetailLoading(true)
+      api.get(`/local-orders/${Number(focus)}`)
+        .then((res) => setDetail(res.data))
+        .catch(() => {})
+        .finally(() => setDetailLoading(false))
+    }
   }, [])
 
   const lineAmt = (l) => (Number(l.quantity) || 0) * (Number(l.unit_price) || 0)
@@ -90,7 +104,7 @@ export default function LocalOrders() {
   }
 
   const openCreate = () => {
-    setForm({ customer_id: null, customer_name: '', local_order_type: 'TRADING', order_date: today(), delivery_date: '', remarks: '', so_no: '', customer_po_no: '', lines: [{ ...emptyLine }] })
+    setForm({ customer_id: null, customer_name: '', customer_mobile: '', customer_email: '', local_order_type: 'TRADING', order_date: today(), delivery_date: '', remarks: '', so_no: '', customer_po_no: '', lines: [{ ...emptyLine }] })
     setErrors({})
     setEditing(null)
     setShowOrderForm(true)
@@ -99,15 +113,17 @@ export default function LocalOrders() {
   const openEdit = (r) => {
     setForm({
       customer_id: r.customer_id, customer_name: r.customer_name || r.customer || '',
+      customer_mobile: r.customer_mobile || '', customer_email: r.customer_email || '',
       local_order_type: r.order_type || 'TRADING',
       order_date: r.order_date || today(), delivery_date: r.delivery_date || '',
       so_no: r.so_no || '',
       customer_po_no: r.customer_po_no || '',
+      status: r.order_status || 'New',
       remarks: r.commitment || r.remarks || '',
       lines: (r.lines || []).map((ln) => ({
         id: ln.id, product_id: ln.product_id, item_code: ln.item_code || '',
         description: ln.description || ln.model || '', quantity: ln.quantity,
-        unit_price: ln.rate != null ? ln.rate : null, less: ln.less != null ? ln.less : null,
+        uom: ln.uom || '', unit_price: ln.rate != null ? ln.rate : null, less: ln.less != null ? ln.less : null,
       })),
     })
     setErrors({})
@@ -129,6 +145,7 @@ export default function LocalOrders() {
       product_id: id,
       description: id ? lines[i].description : (manual || ''),
       item_code: p ? (lines[i].item_code || p.item_code || '') : (lines[i].item_code || ''),
+      uom: p ? (lines[i].uom || p.uom || '') : (lines[i].uom || ''),
     }
     setForm({ ...form, lines })
   }
@@ -151,19 +168,22 @@ export default function LocalOrders() {
   const payload = () => ({
     customer_id: form.customer_id ? Number(form.customer_id) : null,
     customer_name: form.customer_name || '',
+    customer_mobile: (form.customer_mobile || '').trim(),
+    customer_email: (form.customer_email || '').trim(),
     local_order_type: form.local_order_type || 'TRADING',
     order_date: form.order_date || today(),
     required_delivery_date: form.delivery_date || null,
     so_no: (form.so_no || '').trim(),
     customer_po_no: (form.customer_po_no || '').trim(),
     remarks: form.remarks || '',
-    status: editing ? undefined : 'New',
+    status: editing ? (form.status || undefined) : 'New',
     lines: (form.lines || []).map((l) => ({
       id: editing ? (l.id || null) : undefined,
       product_id: l.product_id ? Number(l.product_id) : null,
       item_code: l.item_code || '',
       description: l.description || '',
       quantity: Number(l.quantity),
+      uom: (l.uom || '').trim(),
       unit_price: l.unit_price != null && l.unit_price !== '' ? Number(l.unit_price) : null,
       less: l.less != null && l.less !== '' ? Number(l.less) : null,
       amount: lineAmt(l),
@@ -184,6 +204,118 @@ export default function LocalOrders() {
       })
       .catch((err) => setErrors({ api: errText(err) }))
       .finally(() => setSaving(false))
+  }
+
+  // ---- bulk CSV/Excel import ----
+  const runImport = async () => {
+    if (!importFile) { window.alert('Choose a CSV or Excel file first'); return }
+    const fd = new FormData()
+    fd.append('file', importFile)
+    setImportBusy(true)
+    try {
+      const { data } = await api.post('/local-orders/import', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      setImportResult(data)
+      flash(`Import done — ${data.summary.created} order(s) created, ${data.summary.lines} line(s), ${data.summary.errors} row error(s)`)
+      load()
+      loadMeta()
+    } catch (e) {
+      window.alert(e.response?.data?.detail || 'Import failed')
+    } finally {
+      setImportBusy(false)
+    }
+  }
+
+  // ---- share (Web Share API with clipboard fallback) ----
+  const shareOrder = async () => {
+    const d = detail
+    if (!d || d.loading) return
+    const items = (d.lines || []).map((l) =>
+      `- ${l.description || l.model || l.item_code || 'Item'}: ${fmtNum(l.quantity)}${l.uom ? ' ' + l.uom : ''}` +
+      (l.rate != null ? ` @ ${fmtNum(l.rate)} = ${fmtNum(l.amount)}` : ''),
+    ).join('\n')
+    const text = `LOCAL ORDER ${d.order_no}\nCustomer: ${d.customer || '—'}\nSO No: ${d.so_no || '—'} · PO No: ${d.customer_po_no || '—'}\nOrder Date: ${d.order_date || '—'} · Delivery: ${d.delivery_date || '—'}\nStatus: ${d.status} · Dispatched: ${fmtNum(d.dispatched_qty)} · Pending: ${fmtNum(d.pending_qty)}\nTotal Amount: ${fmtNum(d.total_value)}\n\n${items}`
+    const url = `${window.location.origin}/local-orders?order=${d.id}`
+    const copy = async () => {
+      try { await navigator.clipboard.writeText(`${text}\n\n${url}`); flash('Order details copied to clipboard') }
+      catch { window.alert('Could not copy. Please share manually.') }
+    }
+    if (navigator.share) {
+      try { await navigator.share({ title: `Local Order ${d.order_no}`, text, url }) }
+      catch (e) { if (e?.name !== 'AbortError') await copy() }
+    } else {
+      await copy()
+    }
+  }
+
+  // ---- PDF (browser print to PDF) ----
+  const downloadPdf = () => {
+    const d = detail
+    if (!d || d.loading) return
+    const escHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+    const lineRows = (d.lines || []).map((l) => (
+      `<tr><td>${escHtml(l.description || l.model || '—')}</td>` +
+      `<td class="r">${fmtNum(l.quantity)} ${escHtml(l.uom || '')}</td>` +
+      `<td class="r">${l.rate != null ? fmtNum(l.rate) : '—'}</td>` +
+      `<td class="r">${l.less != null ? fmtNum(l.less) : '—'}</td>` +
+      `<td class="r">${fmtNum(l.amount)}</td>` +
+      `<td class="r">${fmtNum(l.dispatched_qty)}</td>` +
+      `<td class="r">${fmtNum(l.balance_qty)}</td></tr>`
+    )).join('')
+    const hisRows = flattenedHistory.map((h) => (
+      `<tr><td>${escHtml(h.dispatch_no || '—')}</td>` +
+      `<td>${escHtml(h.description || h.item_code || '—')}</td>` +
+      `<td class="r">${fmtNum(h.quantity)}</td>` +
+      `<td>${escHtml(h.dispatch_date || '—')}</td></tr>`
+    )).join('')
+    const html = `<!doctype html><html><head><meta charset="utf-8"><title>Local Order ${escHtml(d.order_no)}</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #111; margin: 28px; }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: #666; font-size: 11px; margin-bottom: 16px; }
+  .meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 18px; border: 1px solid #ddd; border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; }
+  .meta .lbl { display: block; color: #888; font-size: 9px; text-transform: uppercase; letter-spacing: .4px; margin-bottom: 2px; }
+  .meta .val { font-weight: 600; }
+  h2 { font-size: 13px; margin: 16px 0 8px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; font-size: 11px; }
+  th { background: #f4f4f4; text-transform: uppercase; font-size: 9px; letter-spacing: .4px; color: #555; }
+  .r { text-align: right; }
+  .total td { font-weight: 700; background: #fafafa; }
+  .foot { margin-top: 26px; font-size: 10px; color: #888; }
+  @media print { body { margin: 12mm; } }
+</style></head><body>
+<h1>Local Order — ${escHtml(d.order_no)}</h1>
+<div class="sub">Generated ${escHtml(new Date().toLocaleString())}</div>
+<div class="meta">
+  <div><span class="lbl">Customer</span><span class="val">${escHtml(d.customer || '—')}</span></div>
+  <div><span class="lbl">Mobile</span><span class="val">${escHtml(d.customer_mobile || '—')}</span></div>
+  <div><span class="lbl">Email</span><span class="val">${escHtml(d.customer_email || '—')}</span></div>
+  <div><span class="lbl">Order Type</span><span class="val">${escHtml(d.order_type || '—')}</span></div>
+  <div><span class="lbl">SO Number</span><span class="val">${escHtml(d.so_no || '—')}</span></div>
+  <div><span class="lbl">PO Number</span><span class="val">${escHtml(d.customer_po_no || '—')}</span></div>
+  <div><span class="lbl">Order Date</span><span class="val">${escHtml(d.order_date || '—')}</span></div>
+  <div><span class="lbl">Delivery Date</span><span class="val">${escHtml(d.delivery_date || '—')}</span></div>
+  <div><span class="lbl">Status</span><span class="val">${escHtml(d.status || '—')}</span></div>
+  <div><span class="lbl">Total Amount</span><span class="val">${fmtNum(d.total_value)}</span></div>
+  <div><span class="lbl">Dispatched</span><span class="val">${fmtNum(d.dispatched_qty)}</span></div>
+  <div><span class="lbl">Pending</span><span class="val">${fmtNum(d.pending_qty)}</span></div>
+</div>
+<h2>Order Lines</h2>
+<table><thead><tr><th>Item</th><th class="r">Qty</th><th class="r">Rate</th><th class="r">Less</th><th class="r">Amount</th><th class="r">Dispatched</th><th class="r">Pending</th></tr></thead>
+<tbody>${lineRows || '<tr><td colspan="7">No lines</td></tr>'}</tbody>
+<tfoot><tr class="total"><td colspan="4">Order Total</td><td class="r">${fmtNum(d.total_value)}</td><td class="r">${fmtNum(d.dispatched_qty)}</td><td class="r">${fmtNum(d.pending_qty)}</td></tr></tfoot></table>
+<h2>Dispatch History</h2>
+<table><thead><tr><th>Dispatch</th><th>Item</th><th class="r">Qty</th><th>Date</th></tr></thead>
+<tbody>${hisRows || '<tr><td colspan="4">No dispatches yet</td></tr>'}</tbody></table>
+<div class="foot">Generated by Kalika ERP — Local Orders</div>
+</body></html>`
+    const win = window.open('', '_blank', 'width=900,height=760')
+    if (!win) { window.alert('Popup blocked — please allow popups to generate the PDF.'); return }
+    win.document.write(html)
+    win.document.close()
+    win.focus()
+    setTimeout(() => win.print(), 350)
   }
 
   // ---- dispatch entries (actual dispatch, reuses the sales-order Dispatch module) ----
@@ -329,6 +461,10 @@ export default function LocalOrders() {
       return <span className="text-xs block max-w-40 truncate">{first?.description || first?.model || '—'}{(r.lines?.length || 0) > 1 ? ` +${r.lines.length - 1}` : ''}</span>
     } },
     { key: 'quantity', label: 'Qty', render: (r) => fmtNum(r.quantity) },
+    { key: 'unit', label: 'Unit', render: (r) => {
+      const first = (r.lines || [])[0]
+      return first?.uom ? <span className="text-xs">{first.uom}</span> : '—'
+    } },
     { key: 'rate', label: 'Rate', render: (r) => {
       const first = (r.lines || [])[0]
       return first?.rate != null ? fmtNum(first.rate) : '—'
@@ -346,9 +482,7 @@ export default function LocalOrders() {
     { key: 'actions', label: '', render: (r) => (
       <div className="flex items-center gap-0.5">
         <button onClick={() => openDetail(r)} className="text-slate-400 hover:text-slate-700 p-1 hover:bg-gray-100 rounded" title="View"><Eye size={14} /></button>
-        {r.status === 'Production Required' ? (
-          <button onClick={() => goToProduction(r.id)} className="text-amber-600 hover:text-amber-800 p-1 hover:bg-amber-50 rounded" title="Manufacture — create a production plan for this order"><Factory size={14} /></button>
-        ) : r.stock_summary?.transfer_required ? (
+        {r.stock_summary?.transfer_required ? (
           <button onClick={() => transferForOrder(r)} className="text-violet-600 hover:text-violet-800 p-1 hover:bg-violet-50 rounded" title="Stock exists — transfer Main Store → Dispatch"><ArrowLeftRight size={14} /></button>
         ) : (
           <button onClick={() => openNewEntry(r, (r.lines || [])[0])} className="text-blue-500 hover:text-blue-700 p-1 hover:bg-blue-50 rounded" title="Dispatch now"><Truck size={14} /></button>
@@ -363,6 +497,7 @@ export default function LocalOrders() {
     { key: 'description', label: 'Size / Description', render: (r) => <span className="font-medium">{r.description || r.model || '—'}</span> },
     { key: 'item_code', label: 'Item Code', render: (r) => <span className="font-mono text-xs">{r.item_code || '—'}</span> },
     { key: 'quantity', label: 'Order Qty', render: (r) => fmtNum(r.quantity) },
+    { key: 'unit', label: 'Unit', render: (r) => <span className="text-xs">{r.uom || '—'}</span> },
     { key: 'rate', label: 'Rate', render: (r) => r.rate != null ? fmtNum(r.rate) : '—' },
     { key: 'less', label: 'Less', render: (r) => r.less != null ? fmtNum(r.less) : '—' },
     { key: 'amount', label: 'Amount', render: (r) => <span className="font-mono text-xs font-medium">{fmtNum(r.amount)}</span> },
@@ -431,7 +566,10 @@ export default function LocalOrders() {
   return (
     <div className="animate-fade-in-up">
       <PageHeader title="Local Orders" subtitle="Complete live workflow — order • stock check • dispatch • history"
-        actions={<button onClick={openCreate} className="btn btn-primary"><Plus size={15} /> New Local Order</button>} />
+        actions={<div className="flex items-center gap-2">
+          <button onClick={() => setShowImport(true)} className="btn btn-secondary"><Upload size={15} /> Import</button>
+          <button onClick={openCreate} className="btn btn-primary"><Plus size={15} /> New Local Order</button>
+        </div>} />
 
       {success && (
         <div className="mb-4 rounded-lg bg-green-50 border border-green-200 text-green-700 text-sm px-4 py-3 flex items-center gap-2">
@@ -440,34 +578,48 @@ export default function LocalOrders() {
       )}
 
       <div className="grid grid-cols-1 sm:grid-cols-4 gap-3 mb-5">
-        <StatCard label="Local Orders" value={rows.length} icon={Store} iconClass="bg-amber-50 text-amber-600" />
+        <StatCard label="Active Local Orders" value={rows.length} icon={Store} iconClass="bg-amber-50 text-amber-600" />
         <StatCard label="Ready for Dispatch" value={readyCount} icon={PackageSearch} iconClass="bg-teal-50 text-teal-600" />
         <StatCard label="Partially Dispatched" value={partialCount} icon={Truck} iconClass="bg-blue-50 text-blue-600" />
         <StatCard label="Total Amount" value={fmtNum(totalValue)} icon={Store} iconClass="bg-blue-50 text-blue-600" />
       </div>
 
-      <Card title="Local Orders" subtitle="Order Qty vs actual dispatch — pending is always derived from real data" className="mb-6">
-        {rows.length === 0 ? <Empty text="No local orders" /> : <Table columns={orderCols} data={rows} keyField="id" onRowClick={openDetail} stickyColumns={['order_no']} dense />}
+      <Card title="Local Orders" subtitle="Active/incomplete orders only — completed orders move to history below" className="mb-6">
+        {rows.length === 0 ? <Empty text="No active local orders" /> : <Table columns={orderCols} data={rows} keyField="id" onRowClick={openDetail} stickyColumns={['order_no']} dense />}
       </Card>
 
-      <Card title="Production / Dispatch Plans (Local)">
+      <Card title="Completed Local Orders" subtitle="Historical completed-order report for records / invoicing" className="mb-6"
+        actions={<button onClick={() => downloadFile('/local-orders/report/orders', 'local_orders_completed.csv')} className="btn btn-secondary btn-sm"><Download size={13} /> Download CSV</button>}>
+        <div className="text-sm text-slate-500">
+          {completedTotal} completed local order(s). The active list above shows {rows.length} in-progress order(s). Download the full completed-order history (CSV).
+        </div>
+      </Card>
+
+      <Card title="Production / Dispatch Plans (Local)" subtitle="Production & dispatch plans with linked order, production and dispatch progress"
+        actions={<button onClick={() => downloadFile('/local-orders/report/plans', 'local_plans.csv')} className="btn btn-secondary btn-sm"><Download size={13} /> Download CSV</button>}>
         {plans.length === 0 ? <Empty text="No plans" /> : <Table columns={planCols} data={plans} keyField="id" stickyColumns={['model']} dense />}
       </Card>
 
       {/* Detail modal */}
       <Modal open={!!detail} title={detail && !detail.loading ? `Local Order ${detail.order_no}` : 'Loading…'} onClose={() => setDetail(null)} wide
         footer={<>
-          {detail && !detail.loading && (detail.status === 'Production Required'
-            ? <button onClick={() => { const orderId = detail.id; setDetail(null); goToProduction(orderId) }} className="btn btn-primary mr-auto"><Factory size={14} className="mr-1" /> Go to Production</button>
-            : detail.stock_summary?.transfer_required
+          {detail && !detail.loading && (detail.stock_summary?.transfer_required
             ? <button onClick={() => transferForOrder(detail)} className="btn btn-secondary mr-auto"><ArrowLeftRight size={14} className="mr-1" /> Transfer to Dispatch</button>
             : <button onClick={() => openNewEntry(detail, (detail.lines || [])[0])} className="btn btn-primary mr-auto"><Truck size={14} className="mr-1" /> Dispatch</button>)}
+          {detail && !detail.loading && (
+            <>
+              <button onClick={shareOrder} className="btn btn-secondary"><Share2 size={14} className="mr-1" /> Share</button>
+              <button onClick={downloadPdf} className="btn btn-secondary"><Printer size={14} className="mr-1" /> PDF</button>
+            </>
+          )}
           <button onClick={() => setDetail(null)} className="btn btn-secondary">Close</button>
         </>}>
         {detailLoading || detail?.loading ? <Loading /> : detail && (
           <>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-4 text-sm">
               <div><span className="text-slate-500 block text-xs">Customer</span><span className="font-medium">{detail.customer || '—'}</span></div>
+              <div><span className="text-slate-500 block text-xs">Mobile</span><span className="font-mono text-xs font-medium">{detail.customer_mobile || '—'}</span></div>
+              <div><span className="text-slate-500 block text-xs">Email</span><span className="text-xs font-medium">{detail.customer_email || '—'}</span></div>
               <div><span className="text-slate-500 block text-xs">SO Number</span><span className="font-mono text-xs font-medium">{detail.so_no || '—'}</span></div>
               <div><span className="text-slate-500 block text-xs">PO Number</span><span className="font-mono text-xs font-medium">{detail.customer_po_no || '—'}</span></div>
               <div><span className="text-slate-500 block text-xs">Order Type</span><Badge className={detail.order_type === 'MANUFACTURING' ? 'bg-violet-100 text-violet-700' : 'bg-cyan-100 text-cyan-700'}>{detail.order_type || 'TRADING'}</Badge></div>
@@ -560,9 +712,24 @@ export default function LocalOrders() {
               value={form.customer_id || null}
               initialLabel={!form.customer_id ? (form.customer_name || '') : ''}
               placeholder="Type to search or enter a new customer"
-              onChange={(id, manual) => setForm((f) => ({ ...f, customer_id: id, customer_name: manual }))}
+              onChange={(id, manual) => setForm((f) => {
+                const c = id ? customers.find((cc) => cc.id === id) : null
+                return {
+                  ...f, customer_id: id, customer_name: manual,
+                  customer_mobile: c ? (f.customer_mobile || c.phone || '') : f.customer_mobile,
+                  customer_email: c ? (f.customer_email || c.email || '') : f.customer_email,
+                }
+              })}
             />
             {errors.customer_id && <p className="text-xs text-red-600 mt-1">{errors.customer_id}</p>}
+          </div>
+          <div>
+            <label className="block text-slate-500 text-xs mb-1">Customer Mobile</label>
+            <input value={form.customer_mobile || ''} onChange={(e) => setForm({ ...form, customer_mobile: e.target.value })} type="tel" placeholder="e.g. 98XXXXXXXX" className="input" />
+          </div>
+          <div>
+            <label className="block text-slate-500 text-xs mb-1">Customer Email</label>
+            <input value={form.customer_email || ''} onChange={(e) => setForm({ ...form, customer_email: e.target.value })} type="email" placeholder="e.g. name@company.com" className="input" />
           </div>
           <div>
             <label className="block text-slate-500 text-xs mb-1">SO Number <span className="text-slate-400">(manual)</span></label>
@@ -579,6 +746,22 @@ export default function LocalOrders() {
               <option value="MANUFACTURING">Manufacturing</option>
             </select>
           </div>
+          {editing && (
+            <div>
+              <label className="block text-slate-500 text-xs mb-1">Status <span className="text-slate-400">(manual)</span></label>
+              <select value={form.status || 'New'} onChange={(e) => setForm({ ...form, status: e.target.value })} className="input">
+                <option value="New">New</option>
+                <option value="In Production">Production Required</option>
+                <option value="Production Completed">Production Completed</option>
+                <option value="Ready">Ready for Dispatch</option>
+                <option value="Confirmed">Purchase / Stock Required</option>
+                <option value="Dispatched">Partially Dispatched</option>
+                <option value="Completed">Completed</option>
+                <option value="Cancelled">Cancelled</option>
+              </select>
+              <p className="text-[0.6875rem] text-slate-400 mt-1">User-controlled — Production never changes it automatically.</p>
+            </div>
+          )}
           <div>
             <label className="block text-slate-500 text-xs mb-1">Order Date</label>
             <input type="date" value={form.order_date || ''} onChange={(e) => setForm({ ...form, order_date: e.target.value })} className="input" />
@@ -617,14 +800,18 @@ export default function LocalOrders() {
                   <label className="block text-slate-500 text-[0.6875rem] mb-1">Size / Description</label>
                   <input value={l.description || ''} onChange={(e) => updateLine(i, 'description', e.target.value)} className="input py-1.5" />
                 </div>
-                <div className="col-span-2 sm:col-span-5">
+                <div className="col-span-2 sm:col-span-3">
                   <label className="block text-slate-500 text-[0.6875rem] mb-1">Item Code</label>
                   <input value={l.item_code || ''} onChange={(e) => updateLine(i, 'item_code', e.target.value)} placeholder="e.g. LAP-001" className="input py-1.5" />
                 </div>
-                <div className="col-span-1 sm:col-span-3">
+                <div className="col-span-1 sm:col-span-2">
                   <label className="block text-slate-500 text-[0.6875rem] mb-1">Qty <span className="text-red-500">*</span></label>
                   <input type="number" min="1" step="any" value={l.quantity ?? ''} onChange={(e) => updateLine(i, 'quantity', e.target.value)} className="input py-1.5" />
                   {errors[`line_${i}_qty`] && <p className="text-xs text-red-600 mt-1">{errors[`line_${i}_qty`]}</p>}
+                </div>
+                <div className="col-span-1 sm:col-span-3">
+                  <label className="block text-slate-500 text-[0.6875rem] mb-1">Unit</label>
+                  <input value={l.uom || ''} list="local-uom-options" onChange={(e) => updateLine(i, 'uom', e.target.value)} placeholder="KG / NOS / NO. OF BOX" className="input py-1.5" />
                 </div>
                 <div className="col-span-1 sm:col-span-3">
                   <label className="block text-slate-500 text-[0.6875rem] mb-1">Rate</label>
@@ -641,6 +828,9 @@ export default function LocalOrders() {
               </div>
             ))}
 
+            <datalist id="local-uom-options">
+              <option value="KG" /><option value="NOS" /><option value="NO. OF BOX" />
+            </datalist>
             {errors.lines && <p className="text-xs text-red-600 mt-1">{errors.lines}</p>}
 
             <div className="flex items-center justify-between border-t border-gray-100 pt-3 mt-1">
@@ -710,6 +900,41 @@ export default function LocalOrders() {
           <p className="text-xs text-slate-400">Each dispatch creates a separate date-wise historical transaction; stock is deducted from the Dispatch location. Editing an order afterwards never rewrites this history.</p>
         </Modal>
       )}
+
+      <Modal open={showImport} title="Import Local Orders"
+        onClose={() => { setShowImport(false); setImportResult(null); setImportFile(null) }}
+        footer={<>
+          <button onClick={() => { setShowImport(false); setImportResult(null); setImportFile(null) }} className="btn btn-secondary" disabled={importBusy}>Close</button>
+          <button onClick={runImport} className="btn btn-primary" disabled={importBusy}>
+            {importBusy ? 'Importing…' : 'Import'}
+          </button>
+        </>}>
+        <p className="text-sm text-gray-500 mb-4">
+          CSV or Excel. Required: Customer, Size/Description or Item Code, Quantity.
+          Optional: SO Number, PO Number, Order Date, Delivery Date, Order Type,
+          Mobile, Email, Unit, Rate, Less, Remarks. Rows are grouped into one order
+          per SO Number (or per PO Number when no SO number, otherwise per row). SO
+          Numbers are kept exactly as entered.
+        </p>
+        <input type="file" accept=".csv,.xlsx,.xls" className="input mb-4"
+          onChange={(e) => setImportFile(e.target.files?.[0])} />
+        {importResult && (
+          <div className="bg-gray-50 rounded-lg p-4 text-sm">
+            <p className="font-bold mb-1">Results</p>
+            <p>Created: {importResult.summary?.created ?? 0}, Errors: {importResult.summary?.errors ?? 0}, Lines: {importResult.summary?.lines ?? 0}</p>
+            {(importResult.created || []).length > 0 && (
+              <ul className="mt-2 text-green-700 text-xs max-h-32 overflow-auto">
+                {importResult.created.map((c) => <li key={c.order_id}>Row {c.rows?.join(', ') || '—'}: {c.order_no}{c.so_no ? ` (SO ${c.so_no})` : ''} — {c.lines} line(s)</li>)}
+              </ul>
+            )}
+            {(importResult.errors || []).length > 0 && (
+              <ul className="mt-2 text-red-600 text-xs max-h-40 overflow-auto">
+                {importResult.errors.map((e, i) => <li key={i}>Row {e.row}: {e.message}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+      </Modal>
 
       {showTransferModal && (
         <StockTransferModal

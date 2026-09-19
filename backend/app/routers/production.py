@@ -1,7 +1,7 @@
 """Production management (CRUD + daily movements + status lifecycle)."""
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, UploadFile, File
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -16,7 +16,10 @@ from ..schemas import ProductionOrderCreate, ProductionOrderOut, ProductionOrder
 from ..services.business import sync_purchase_shortages
 from ..services.customers import get_or_create_customer
 from ..services.reorder_alerts import refresh_reorder_alert
-from ..services.stock_service import apply_movement, reconvert_document, reverse_and_remove_ref
+from ..services.stock_service import (
+    apply_movement, reconvert_document, resolve_or_create_product, reverse_and_remove_ref,
+)
+from ..services.import_common import normalize_header, read_table
 from datetime import date
 
 router = APIRouter(prefix="/production", tags=["production"])
@@ -110,14 +113,27 @@ def list_production(
 @router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
 def create_production(body: ProductionOrderCreate, db: Annotated[Session, Depends(get_db)],
                       user: AllStaff):
-    get_or_404(db, Product, body.product_id)
+    # Product may be picked from master (product_id) or typed as Item Code /
+    # Model; a typed code/model is resolved against the product master and
+    # created lazily so manual production planning never needs a dropdown pick.
+    if body.product_id:
+        get_or_404(db, Product, body.product_id)
+        product_id = body.product_id
+    else:
+        prod = resolve_or_create_product(
+            db, body.item_code, (body.model or body.item_code or "").strip(), allow_blank=True,
+        )
+        if prod is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="Item Code or Model is required to create a production order")
+        product_id = prod.id
     if body.customer_name and body.customer_name.strip() and not body.customer_id:
         c = get_or_create_customer(db, body.customer_name)
         customer_id = c.id if c else None
     else:
         customer_id = body.customer_id
     o = ProductionOrder(
-        order_no=body.order_no or _next_no(db), product_id=body.product_id,
+        order_no=body.order_no or _next_no(db), product_id=product_id,
         customer_id=customer_id,
         section=body.section, schedule_qty=body.schedule_qty, ask_till_date=body.ask_till_date,
         produced_qty=body.produced_qty, opening_stock=body.opening_stock,
@@ -249,6 +265,34 @@ def update_production(order_id: int, body: ProductionOrderUpdate,
     return _serialize_po(db, o)
 
 
+@router.patch("/{order_id}/complete", response_model=dict)
+def complete_production(order_id: int, db: Annotated[Session, Depends(get_db)], user: AllStaff):
+    """Mark a production order as Completed.
+    
+    Sets status to Completed and completion_date to today if not already set.
+    Does NOT create new production movements or stock entries - these are
+    derived from the existing movement log via _recalc_status() and
+    apply_movement() in add_movement().
+    
+    Idempotent: repeated calls have no additional effect beyond setting
+    the status to Completed.
+    """
+    o = get_or_404(db, ProductionOrder, order_id)
+    
+    if o.status.value == 'Completed':
+        return {"message": "Production order is already completed", "order_no": o.order_no}
+    
+    o.status = ProductionStatus.completed
+    if not o.completion_date:
+        o.completion_date = date.today()
+    _recalc_status(o)
+    
+    db.commit()
+    db.refresh(o)
+    write_audit(db, user, "UPDATE", "production_orders", o.id, f"Completed production order {o.order_no}")
+    return {"message": "Production order marked as completed", "order_no": o.order_no, "completion_date": o.completion_date, "completion_pct": o.completion_pct}
+
+
 @router.post("/{order_id}/movements", response_model=dict)
 def add_movement(order_id: int, quantity: float, production_date: str,
                  db: Annotated[Session, Depends(get_db)], user: AllStaff):
@@ -303,3 +347,166 @@ def delete_production(order_id: int, db: Annotated[Session, Depends(get_db)],
     db.commit()
     write_audit(db, user, "DELETE", "production_orders", order_id, f"Deleted production order {o.order_no}")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _normalize_header(h: str) -> str:
+    """Normalize a header name for flexible column mapping."""
+    return normalize_header(h)
+
+
+def _parse_production_import(headers: list[str], rows: list[list[str]]) -> tuple[list[dict], list[dict]]:
+    """Parse imported production plan rows.
+    
+    Returns (valid_rows, error_rows) where each row dict has mapped field names.
+    """
+    # Column name mapping (normalized -> field name)
+    col_map = {
+        # Item Code variations
+        "item code": "item_code",
+        "item_code": "item_code",
+        "itemcode": "item_code",
+        "item": "item_code",
+        # Model variations
+        "model": "model",
+        # Schedule Quantity variations
+        "schedule": "schedule_qty",
+        "schedule qty": "schedule_qty",
+        "schedule quantity": "schedule_qty",
+        # Ask Till Date variations
+        "ask till date": "ask_till_date",
+        "ask_till_date": "ask_till_date",
+        # Production Qty variations
+        "production qty": "produced_qty",
+        "production quantity": "produced_qty",
+        "qty": "produced_qty",
+        # % Comp variations
+        "% comp": "completion_pct",
+        "% completion": "completion_pct",
+        # Balance Qty variations
+        "balance qty": "balance_qty",
+        "balance quantity": "balance_qty",
+        # Status variations (must match ProductionStatus exactly)
+        "status": "status",
+        # Remarks
+        "remarks": "remarks",
+    }
+    
+    # Build a mapping from column index to field name
+    field_map: dict[int, str] = {}
+    for idx, header in enumerate(headers):
+        norm = normalize_header(header)
+        if norm in col_map:
+            field_map[idx] = col_map[norm]
+    
+    valid_rows = []
+    error_rows = []
+    
+    for row_idx, row in enumerate(rows, start=1):
+        row_errors = []
+        row_data = {}
+        
+        for col_idx, cell_value in enumerate(row):
+            if col_idx in field_map:
+                field_name = field_map[col_idx]
+                if field_name in ("schedule_qty", "produced_qty", "completion_pct", "balance_qty"):
+                    try:
+                        row_data[field_name] = float(cell_value) if cell_value else 0.0
+                    except (ValueError, TypeError):
+                        row_data[field_name] = 0.0
+                elif field_name == "ask_till_date":
+                    if cell_value:
+                        row_data[field_name] = str(cell_value)
+                    else:
+                        row_data[field_name] = None
+                else:
+                    row_data[field_name] = str(cell_value) if cell_value else ""
+        
+        # Validate
+        has_item = row_data.get("item_code", "").strip() != ""
+        has_model = row_data.get("model", "").strip() != ""
+        has_schedule = row_data.get("schedule_qty", 0) > 0
+        valid_statuses = [s.value for s in ProductionStatus]
+        has_valid_status = row_data.get("status", "").strip() in valid_statuses
+        
+        item_code = row_data.get("item_code", "").strip()
+        model = row_data.get("model", "").strip()
+        
+        if not has_item and not has_model:
+            row_errors.append("Missing item code or model")
+        
+        if not has_schedule:
+            row_errors.append("Missing or invalid schedule quantity")
+        
+        if not has_valid_status:
+            row_errors.append(f"Invalid status. Must be one of: {', '.join(valid_statuses)}")
+        
+        if row_errors:
+            error_rows.append({
+                "row": row_idx,
+                "errors": row_errors,
+                "data": {k: v for k, v in row_data.items() if k in ("item_code", "model", "schedule_qty", "ask_till_date", "produced_qty", "completion_pct", "balance_qty", "status", "remarks")},
+            })
+        else:
+            # Resolve product
+            prod = resolve_or_create_product(
+                db=None,
+                item_code=item_code if item_code else None,
+                model=model if model else None,
+                allow_blank=True,
+            )
+            
+            valid_rows.append({
+                "item_code": item_code,
+                "model": model if model else None,
+                "schedule_qty": row_data.get("schedule_qty", 0) or 0,
+                "ask_till_date": row_data.get("ask_till_date"),
+                "produced_qty": row_data.get("produced_qty", 0) or 0,
+                "completion_pct": row_data.get("completion_pct"),
+                "balance_qty": row_data.get("balance_qty"),
+                "status": row_data.get("status", "Planned"),
+                "remarks": row_data.get("remarks", "") or "",
+            })
+    
+    return valid_rows, error_rows
+
+
+@router.post("/import", response_model=dict)
+async def import_production_plans(
+    file: Annotated[UploadFile, File(...)],
+    db: Annotated[Session, Depends(get_db)],
+    user: AllStaff,
+):
+    """Import Production Plans from CSV or Excel file.
+    
+    Supported columns (any order, flexible naming):
+    - Item Code / Model / Schedule / Ask Till Date / Production Qty / % Comp / Balance Qty / Status
+    - Extra columns are ignored.
+    - Column headers are case-insensitive and space/underscore tolerant.
+    
+    Preview is shown first; user confirms to save.
+    Partial import with row-level error reporting.
+    """
+    content = await file.read()
+    filename = file.filename or "production_import.csv"
+    
+    try:
+        headers, rows = read_table(filename, content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+    
+    valid_rows, error_rows = _parse_production_import(headers, rows)
+    
+    preview = {
+        "total_rows": len(rows),
+        "valid_rows": len(valid_rows),
+        "error_rows": len(error_rows),
+        "mapped_columns": {normalize_header(h): i for i, h in enumerate(headers)},
+        "headers": headers,
+        "valid_data": valid_rows,
+        "error_details": error_rows,
+    }
+    
+    return {
+        "preview": preview,
+        "message": "Review the import preview above. Confirm to proceed with import.",
+    }

@@ -25,6 +25,7 @@ _COLUMN_MIGRATIONS = [
     ("raw_material_balances", "max_stock", "DOUBLE PRECISION"),
     ("sales_order_lines", "less", "DOUBLE PRECISION"),
     ("sales_order_lines", "item_code", "VARCHAR(120) DEFAULT ''"),
+    ("sales_order_lines", "uom", "VARCHAR(30) DEFAULT ''"),
     ("sales_orders", "customer_name", "VARCHAR(255)"),
     ("sales_orders", "local_order_type", "VARCHAR(20) DEFAULT 'TRADING'"),
     ("sales_orders", "so_no", "VARCHAR(120)"),
@@ -58,6 +59,41 @@ def _ensure_columns() -> None:
             "         THEN ROUND(CAST(COALESCE(inward_qty, 0) / COALESCE(schedule_qty, 0) AS NUMERIC), 4) ELSE 0 END "
             "WHERE schedule_qty IS NOT NULL AND balance_qty IS NULL"
         ))
+
+
+def _ensure_order_status_enum() -> None:
+    """Add the manual 'Production Completed' value to the sales_orders.status
+    enum type.
+
+    Local Order status is user-controlled; 'Production Completed' is the manual
+    gate between production and dispatch. create_all cannot alter an existing
+    Postgres enum, so add the value idempotently (additive; no data touched).
+    No-op on non-Postgres engines (SQLite stores enums as VARCHAR).
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        type_name = conn.execute(text(
+            "SELECT t.typname FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_type t ON t.oid = a.atttypid "
+            "WHERE c.relname = 'sales_orders' AND a.attname = 'status'"
+        )).scalar()
+        if not type_name:
+            return
+        present = conn.execute(text(
+            "SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
+            "WHERE t.typname = :t AND e.enumlabel = :v"
+        ), {"t": type_name, "v": "production_completed"}).scalar()
+    if present:
+        return
+    # ADD VALUE cannot run inside a transaction block on older Postgres —
+    # use an autocommit connection.
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'production_completed\''))
+        conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'partially_dispatched\''))
+        conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'ready_for_dispatch\''))
+        conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'purchase_required\''))
 
 
 def _ensure_number_indexes() -> None:
@@ -195,6 +231,11 @@ def on_startup():
         log.info("Column migrations applied.")
     except Exception as exc:
         log.error("column migration failed (recoverable): %s", exc)
+    # Manual 'Production Completed' Local Order status (existing Postgres enum).
+    try:
+        _ensure_order_status_enum()
+    except Exception as exc:
+        log.error("order-status enum migration failed (recoverable): %s", exc)
     # SO/PO numbers became manual business references; drop the legacy UNIQUE
     # indexes on them (idempotent, data untouched). Recreated as plain indexes.
     try:

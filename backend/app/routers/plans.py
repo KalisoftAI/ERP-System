@@ -15,7 +15,6 @@ from ..models import (
 )
 from ..schemas import PlanCreate, PlanOut, PlanUpdate
 from ..services.customers import get_or_create_customer
-from ..services.local_orders import sync_local_orders_for_products
 from ..services.reorder_alerts import refresh_reorder_alert
 from ..services.stock_service import (
     apply_movement, get_or_create_inventory, reverse_and_remove_ref,
@@ -55,12 +54,9 @@ def _post_plan_output(db: Session, p: Plan) -> None:
         )
         if p.product_id:
             refresh_reorder_alert(db, p.product_id)
-    # Re-evaluate any local orders that source this product: once the finished
-    # goods are in the Main Store the order moves to "Stock Transfer Required"
-    # (re-salving an already-completed plan re-syncs too, so orders created
-    # before this fix catch up as soon as the plan is touched again).
-    if p.product_id:
-        sync_local_orders_for_products(db, [p.product_id])
+    # NOTE: production output deliberately does NOT touch Local Order status.
+    # Local Order status is user-controlled; completing a production plan only
+    # posts finished-goods stock (below) and never auto-advances any order.
 
 
 def _plan_output_movements(db: Session, plan_id: int) -> list[StockMovement]:
@@ -111,7 +107,6 @@ def _reverse_plan_output(db: Session, p: Plan) -> None:
     reverse_and_remove_ref(db, "plan", p.id)
     if p.product_id:
         refresh_reorder_alert(db, p.product_id)
-        sync_local_orders_for_products(db, [p.product_id])
 
 
 def _resolve_product(db: Session, product_id, model) -> Product | None:
@@ -165,6 +160,8 @@ def list_plans(
     plan_type: str = "",
     status_: str = Query(default="", alias="status"),
     search: str = "",
+    date_from: str = "",
+    date_to: str = "",
     page: int = Query(1, ge=1),
     page_size: int = Query(100, ge=1, le=500),
 ):
@@ -176,6 +173,10 @@ def list_plans(
     if search:
         like = f"%{search}%"
         stmt = stmt.where(Plan.model.ilike(like))
+    if date_from:
+        stmt = stmt.where(Plan.plan_date >= date.fromisoformat(date_from))
+    if date_to:
+        stmt = stmt.where(Plan.plan_date <= date.fromisoformat(date_to))
     total = db.scalar(select(func.count()).select_from(stmt.subquery()))
     rows = db.scalars(stmt.order_by(Plan.plan_date.desc(), Plan.id.desc())
                       .offset((page - 1) * page_size).limit(page_size)).all()

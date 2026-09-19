@@ -457,7 +457,9 @@ class CustomerDispatchOut(ORMModel):
 
 # ------------------------- Production -------------------------
 class ProductionOrderCreate(BaseModel):
-    product_id: int
+    product_id: Optional[int] = None
+    item_code: str = ""
+    model: str = ""
     order_no: Optional[str] = None
     section: str = ""
     schedule_qty: float = 0
@@ -518,11 +520,18 @@ class ProductionOrderOut(ORMModel):
 
 # ------------------------- Orders -------------------------
 def _order_status(obj):
-    """Accept enum member names ('new') and values ('New')."""
+    """Accept enum member names ('new') and values ('New').
+    
+    Raises ValueError for invalid status strings that are not valid OrderStatus values.
+    This ensures the database Enum column only receives valid enum values.
+    """
     if isinstance(obj, str):
+        obj_lower = obj.lower()
         for member in OrderStatus:
-            if member.name.lower() == obj.lower() or member.value.lower() == obj.lower():
+            if member.name.lower() == obj_lower or member.value.lower() == obj_lower:
                 return member.value
+        # Invalid status string — raise error so Pydantic returns 422
+        raise ValueError(f"Invalid OrderStatus: {obj!r}")
     return obj
 
 
@@ -531,6 +540,7 @@ class SalesOrderLineIn(BaseModel):
     description: str = ""
     item_code: str = ""
     quantity: float = 0
+    uom: str = ""
     unit_price: Optional[float] = None
     less: Optional[float] = None
     amount: Optional[float] = None
@@ -542,6 +552,7 @@ class SalesOrderLineUpdate(BaseModel):
     description: Optional[str] = None
     item_code: Optional[str] = None
     quantity: Optional[float] = None
+    uom: Optional[str] = None
     unit_price: Optional[float] = None
     less: Optional[float] = None
     amount: Optional[float] = None
@@ -595,6 +606,8 @@ class LocalOrderCreate(BaseModel):
     customer_po_no: Optional[str] = None
     customer_id: Optional[int] = None
     customer_name: str = ""
+    customer_mobile: str = ""
+    customer_email: str = ""
     local_order_type: Optional[str] = None
     order_date: date = Field(default_factory=date.today)
     required_delivery_date: Optional[date] = None
@@ -608,6 +621,8 @@ class LocalOrderCreate(BaseModel):
 class LocalOrderUpdate(BaseModel):
     customer_id: Optional[int] = None
     customer_name: Optional[str] = None
+    customer_mobile: Optional[str] = None
+    customer_email: Optional[str] = None
     so_no: Optional[str] = None
     customer_po_no: Optional[str] = None
     order_date: Optional[date] = None
@@ -625,6 +640,7 @@ class SalesOrderLineOut(ORMModel):
     product_id: Optional[int]
     description: str
     quantity: float
+    uom: str = ""
     unit_price: Optional[float]
     less: Optional[float]
     amount: Optional[float]
