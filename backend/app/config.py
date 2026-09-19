@@ -39,6 +39,16 @@ class Settings(BaseSettings):
 
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
+    # ---- Email (Gmail SMTP) ----
+    MAIL_ENABLED: bool = False
+    SMTP_HOST: str = "smtp.gmail.com"
+    SMTP_PORT: int = 587
+    SMTP_USE_TLS: bool = True
+    MAIL_USERNAME: str = ""
+    MAIL_PASSWORD: str = ""
+    MAIL_FROM: str = "kalikaenterprises@gmail.com"
+    MAIL_FROM_NAME: str = "Kalika Enterprises"
+
     @property
     def database_url(self) -> str:
         """Resolve DATABASE_URL with Cloud SQL socket support."""

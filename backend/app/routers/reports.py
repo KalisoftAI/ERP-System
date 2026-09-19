@@ -3,16 +3,20 @@ import csv
 import io
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import Response, StreamingResponse
-from sqlalchemy import select, func
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..auth import CurrentUser
 from ..config import settings
 from ..database import get_db
 from ..models import (
-    Customer, Dispatch, DispatchLine, Inventory, Plant, Product, ProductionMovement,
+    Customer, Dispatch, DispatchLine, Inventory, OrderType, Plant, Product, ProductionMovement,
     ProductionOrder, PurchaseOrder, RawMaterialBalance, SalesOrder, SalesOrderLine,
     StockMovement, Supplier,
 )
@@ -567,3 +571,125 @@ def delivery_csv(
                      "(unallocated)", str(u["product_id"] or ""),
                      0, u["quantity"], -u["quantity"], "Unallocated"])
     return _csv_response(headers, data, "delivery_report.csv")
+
+
+# ---------------------------------------------------------------------------
+# Order PDF (Phase Orders Department)
+# ---------------------------------------------------------------------------
+def _order_dispatch_qty(db: Session, o: SalesOrder) -> float:
+    """Order-level dispatched quantity using the same aggregation as the
+    Orders module (preserves existing business calculation)."""
+    return db.scalar(
+        select(func.coalesce(func.sum(DispatchLine.quantity), 0))
+        .select_from(Dispatch)
+        .join(DispatchLine, DispatchLine.dispatch_id == Dispatch.id)
+        .where(Dispatch.sales_order_id == o.id)
+    ) or 0.0 if o.order_type == OrderType.oem else 0.0
+
+
+@router.get("/orders/{order_id}/pdf")
+def order_pdf(
+    order_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    _: CurrentUser,
+):
+    """Download a single order as a branded PDF."""
+    o = db.get(SalesOrder, order_id)
+    if not o:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=40, leftMargin=40,
+                            topMargin=40, bottomMargin=40)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Header
+    story.append(Paragraph("<b>Kalika Enterprises</b>", styles["Title"]))
+    story.append(Paragraph("Kalika ERP — Order Detail", styles["Heading3"]))
+    story.append(Spacer(1, 12))
+
+    customer = o.customer
+    contact = o.customer_contact or (customer.phone if customer else "")
+    email = o.customer_email or (customer.email if customer else "")
+    salesperson = o.salesperson.name if o.salesperson else ""
+
+    meta = [
+        ["Customer", customer.name if customer else (o.customer_name or "—"), "SO No", o.order_no or "—"],
+        ["Contact", contact or "—", "PO No", o.customer_po_no or "—"],
+        ["Email", email or "—", "Order Date", str(o.order_date or "—")],
+        ["Salesperson", salesperson or "—", "Order Type", o.order_type.value if o.order_type else "—"],
+    ]
+    meta_table = Table(meta, colWidths=[80, 200, 80, 120])
+    meta_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f8fafc")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#f8fafc")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#334155")),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e7e8eb")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(meta_table)
+    story.append(Spacer(1, 16))
+
+    # Lines
+    headers = ["Item Code", "Model", "Schedule", "Ask Till", "Dispatch", "% Comp", "Balance", "Opening"]
+    disp_total = _order_dispatch_qty(db, o)
+    rows = []
+    for ln in o.lines:
+        item_code = ln.item_code or (ln.product.item_code if ln.product else "")
+        model = ln.product.model if ln.product else (ln.description or "")
+        rows.append([
+            item_code or "—",
+            model or "—",
+            _fmt_pdf_num(ln.schedule_qty),
+            _fmt_pdf_num(ln.ask_till_date),
+            _fmt_pdf_num(disp_total) if o.order_type == OrderType.oem else "—",
+            f"{(ln.completion_pct or 0) * 100:.1f}%" if ln.completion_pct is not None else "—",
+            _fmt_pdf_num(ln.balance_qty),
+            _fmt_pdf_num(ln.opening_stock),
+        ])
+
+    if rows:
+        line_table = Table([headers] + rows, repeatRows=1)
+        line_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("ALIGN", (2, 0), (-1, -1), "RIGHT"),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e7e8eb")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ]))
+        story.append(line_table)
+    else:
+        story.append(Paragraph("No order lines.", styles["Normal"]))
+
+    if o.remarks:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph(f"<b>Remarks:</b> {o.remarks}", styles["Normal"]))
+
+    doc.build(story)
+    pdf = buf.getvalue()
+    buf.close()
+    safe_name = "".join(c for c in (o.order_no or str(o.id)) if c.isalnum() or c in "-_").strip() or str(o.id)
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=order_{safe_name}.pdf"},
+    )
+
+
+def _fmt_pdf_num(v):
+    """Format numeric value for PDF tables; blank for None."""
+    if v is None:
+        return "—"
+    try:
+        n = float(v)
+        return f"{n:,.2f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(v)

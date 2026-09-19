@@ -545,6 +545,8 @@ class SalesOrder(Base):
     order_no: Mapped[str] = mapped_column(String(120), index=True)
     customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
     customer_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    customer_contact: Mapped[str] = mapped_column(String(60), default="")
+    customer_email: Mapped[str] = mapped_column(String(160), default="")
     order_type: Mapped[OrderType] = mapped_column(Enum(OrderType), default=OrderType.oem, index=True)
     local_order_type: Mapped[str] = mapped_column(String(20), default="TRADING")
     customer_po_no: Mapped[str] = mapped_column(String(120), default="", index=True)
@@ -577,6 +579,11 @@ class SalesOrderLine(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     item_code: Mapped[str] = mapped_column(String(120), default="", index=True)
     quantity: Mapped[float] = mapped_column(Float, default=0)
+    schedule_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ask_till_date: Mapped[float | None] = mapped_column(Float, nullable=True)
+    completion_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    balance_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    opening_stock: Mapped[float | None] = mapped_column(Float, nullable=True)
     uom: Mapped[str] = mapped_column(String(30), default="")
     customer_po_no: Mapped[str] = mapped_column(String(120), default="")
     unit_price: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
@@ -829,3 +836,25 @@ class MigrationLog(Base):
     assumptions: Mapped[str] = mapped_column(Text, default="")
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String(40), default="completed")
+
+
+class EmailType(str, enum.Enum):
+    order_confirmation = "Order Confirmation"
+    dispatch_email = "Dispatch Email"
+
+
+class EmailLog(Base):
+    __tablename__ = "email_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    sales_order_id: Mapped[int | None] = mapped_column(ForeignKey("sales_orders.id"), nullable=True, index=True)
+    dispatch_id: Mapped[int | None] = mapped_column(ForeignKey("dispatches.id"), nullable=True, index=True)
+    email_type: Mapped[EmailType] = mapped_column(Enum(EmailType), index=True)
+    recipient: Mapped[str] = mapped_column(String(160), index=True)
+    subject: Mapped[str] = mapped_column(String(255), default="")
+    status: Mapped[str] = mapped_column(String(40), index=True, default="pending")  # sent / failed
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    sent_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    sales_order: Mapped[SalesOrder | None] = relationship()
+    dispatch: Mapped[Dispatch | None] = relationship()

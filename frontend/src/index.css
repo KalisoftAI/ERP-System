@@ -179,6 +179,22 @@ input[type='number'],
   letter-spacing: 0.01em;
 }
 
+/* Contact / email fields on order forms: wider so full values stay readable. */
+.input.input-contact,
+.input.input-email {
+  min-width: 100%;
+  font-size: 0.9375rem;
+  padding: 0.55rem 0.85rem;
+  min-height: 2.6rem;
+}
+
+@media (min-width: 640px) {
+  .input.input-contact,
+  .input.input-email {
+    min-width: 260px;
+  }
+}
+
 /* Icon-prefixed inputs: left icon is absolutely positioned inside the
    relative container; these keep the caret/text clear of the icon. */
 .input-icon {

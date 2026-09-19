@@ -540,6 +540,11 @@ class SalesOrderLineIn(BaseModel):
     description: str = ""
     item_code: str = ""
     quantity: float = 0
+    schedule_qty: Optional[float] = None
+    ask_till_date: Optional[float] = None
+    completion_pct: Optional[float] = None
+    balance_qty: Optional[float] = None
+    opening_stock: Optional[float] = None
     uom: str = ""
     unit_price: Optional[float] = None
     less: Optional[float] = None
@@ -552,6 +557,11 @@ class SalesOrderLineUpdate(BaseModel):
     description: Optional[str] = None
     item_code: Optional[str] = None
     quantity: Optional[float] = None
+    schedule_qty: Optional[float] = None
+    ask_till_date: Optional[float] = None
+    completion_pct: Optional[float] = None
+    balance_qty: Optional[float] = None
+    opening_stock: Optional[float] = None
     uom: Optional[str] = None
     unit_price: Optional[float] = None
     less: Optional[float] = None
@@ -563,6 +573,8 @@ class SalesOrderCreate(BaseModel):
     order_no: str = Field(min_length=1, max_length=120)
     customer_id: Optional[int] = None
     customer_name: str = ""
+    customer_contact: str = ""
+    customer_email: str = ""
     order_type: OrderType = OrderType.oem
     local_order_type: Optional[str] = None
     customer_po_no: str = ""
@@ -580,6 +592,8 @@ class SalesOrderCreate(BaseModel):
 class SalesOrderUpdate(BaseModel):
     customer_id: Optional[int] = None
     customer_name: Optional[str] = None
+    customer_contact: Optional[str] = None
+    customer_email: Optional[str] = None
     order_type: Optional[OrderType] = None
     order_no: Optional[str] = None
     customer_po_no: Optional[str] = None
@@ -640,6 +654,11 @@ class SalesOrderLineOut(ORMModel):
     product_id: Optional[int]
     description: str
     quantity: float
+    schedule_qty: Optional[float]
+    ask_till_date: Optional[float]
+    completion_pct: Optional[float]
+    balance_qty: Optional[float]
+    opening_stock: Optional[float]
     uom: str = ""
     unit_price: Optional[float]
     less: Optional[float]
@@ -651,6 +670,9 @@ class SalesOrderOut(ORMModel):
     id: int
     order_no: str
     customer_id: Optional[int]
+    customer_name: str = ""
+    customer_contact: str = ""
+    customer_email: str = ""
     order_date: date
     required_delivery_date: Optional[date]
     status: OrderStatus
@@ -658,6 +680,7 @@ class SalesOrderOut(ORMModel):
     remarks: str
     created_at: datetime
     customer: Optional[CustomerOut] = None
+    salesperson: Optional[dict] = None
     lines: list[SalesOrderLineOut] = []
 
 
@@ -930,6 +953,28 @@ class DashboardSummary(BaseModel):
     plant_count: int
     product_count: int
     store_items: int
+
+
+class EmailSendIn(BaseModel):
+    to: str
+    subject: str
+    message: str
+
+
+class EmailPreviewOut(BaseModel):
+    to: str
+    subject: str
+    message: str
+
+
+class EmailHistoryOut(BaseModel):
+    id: int
+    email_type: str
+    recipient: str
+    subject: str
+    status: str
+    error_message: str
+    sent_at: datetime
 
 
 class PageOut(BaseModel):
