@@ -3,6 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from ..auth import AllStaff, CurrentUser
 from ..database import get_db
 from ..models import Alert, AlertType, AlertPriority
 from ..schemas import AlertOut, AlertUpdate
@@ -12,6 +13,7 @@ router = APIRouter(prefix="/alerts", tags=["Alerts"])
 
 @router.get("", response_model=list[AlertOut])
 def list_alerts(
+    _: CurrentUser,
     type: str | None = None,
     priority: str | None = None,
     status: str | None = None,
@@ -31,7 +33,7 @@ def list_alerts(
 
 
 @router.get("/count")
-def alert_count(db: Session = Depends(get_db)):
+def alert_count(_: CurrentUser, db: Session = Depends(get_db)):
     """Return unread alert count for the notification bell."""
     unread = db.query(func.count(Alert.id)).filter(
         Alert.is_read == False, Alert.status == "OPEN"
@@ -44,7 +46,7 @@ def alert_count(db: Session = Depends(get_db)):
 
 
 @router.patch("/{alert_id}", response_model=AlertOut)
-def update_alert(alert_id: int, body: AlertUpdate, db: Session = Depends(get_db)):
+def update_alert(alert_id: int, body: AlertUpdate, _: AllStaff, db: Session = Depends(get_db)):
     alert = db.get(Alert, alert_id)
     if not alert:
         raise HTTPException(404, "Alert not found")
@@ -58,7 +60,7 @@ def update_alert(alert_id: int, body: AlertUpdate, db: Session = Depends(get_db)
 
 
 @router.post("/mark-all-read")
-def mark_all_read(db: Session = Depends(get_db)):
+def mark_all_read(_: AllStaff, db: Session = Depends(get_db)):
     """Mark all OPEN alerts as read."""
     now = datetime.now(timezone.utc)
     db.query(Alert).filter(Alert.is_read == False, Alert.status == "OPEN").update(
@@ -70,6 +72,7 @@ def mark_all_read(db: Session = Depends(get_db)):
 
 @router.post("", status_code=201)
 def create_alert(
+    _: AllStaff,
     type: str,
     message: str,
     priority: str = "MEDIUM",
@@ -98,7 +101,7 @@ def create_alert(
 
 
 @router.post("/resolve-by-type")
-def resolve_by_type(entity_type: str, entity_id: int, db: Session = Depends(get_db)):
+def resolve_by_type(entity_type: str, entity_id: int, _: AllStaff, db: Session = Depends(get_db)):
     """Resolve all open alerts for a specific entity."""
     now = datetime.now(timezone.utc)
     db.query(Alert).filter(
