@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Factory, Lock, User, ShieldCheck, Boxes, Truck, ChartBar, Eye, EyeOff } from 'lucide-react'
+import { Lock, User, ShieldCheck, Boxes, Truck, ChartBar, Eye, EyeOff } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 
 export default function Login() {
@@ -45,8 +45,8 @@ export default function Login() {
         {/* Brand panel */}
         <div className="hidden md:flex flex-col justify-between bg-gradient-to-br from-amber-500 via-amber-600 to-amber-700 p-10 text-white">
           <div className="flex items-center gap-3">
-            <div className="h-12 w-12 rounded-xl bg-white/15 backdrop-blur flex items-center justify-center">
-              <Factory size={26} />
+            <div className="h-12 rounded-xl bg-white px-3 flex items-center justify-center shadow">
+              <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-7 w-auto" />
             </div>
             <div>
               <h1 className="text-2xl font-extrabold tracking-tight">Kalika ERP</h1>
@@ -73,8 +73,8 @@ export default function Login() {
         {/* Form panel */}
         <div className="bg-white p-8 sm:p-10">
           <div className="md:hidden flex items-center gap-3 mb-6">
-            <div className="h-11 w-11 rounded-lg bg-amber-400 flex items-center justify-center">
-              <Factory className="text-slate-900" size={24} />
+            <div className="h-11 rounded-lg bg-white border border-slate-200 px-2.5 flex items-center justify-center">
+              <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-6 w-auto" />
             </div>
             <div>
               <h1 className="text-xl font-bold text-slate-900">Kalika ERP</h1>

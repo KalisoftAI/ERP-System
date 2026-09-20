@@ -165,13 +165,13 @@ export default function Layout() {
         {/* Brand */}
         <div className={`flex items-center gap-3 px-4 py-5 border-b border-slate-800 ${collapsed ? 'justify-center px-2' : ''}`}>
           {collapsed ? (
-            <div className="h-9 w-9 rounded-lg brand-gradient flex items-center justify-center shrink-0 shadow-md">
-              <Factory2Icon />
+            <div className="h-9 w-9 rounded-lg bg-white flex items-center justify-center shrink-0 shadow-md overflow-hidden">
+              <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-full w-full object-cover object-right" />
             </div>
           ) : (
             <>
-              <div className="h-10 w-10 rounded-xl brand-gradient flex items-center justify-center shrink-0 shadow-lg">
-                <Factory2Icon />
+              <div className="h-10 rounded-xl bg-white flex items-center justify-center shrink-0 shadow-lg px-2">
+                <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-6 w-auto" />
               </div>
               <div className="min-w-0">
                 <div className="text-white font-bold text-[0.9375rem] leading-tight tracking-tight">Kalika ERP</div>
@@ -213,7 +213,9 @@ export default function Layout() {
           <aside className="absolute inset-y-0 left-0 w-72 bg-slate-900 text-slate-300 flex flex-col shadow-2xl animate-slide-in-right">
             <div className="flex items-center justify-between px-4 py-5 border-b border-slate-800">
               <div className="flex items-center gap-3">
-                <div className="h-10 w-10 rounded-xl brand-gradient flex items-center justify-center shrink-0 shadow-lg"><Factory2Icon /></div>
+                <div className="h-10 rounded-xl bg-white flex items-center justify-center shrink-0 shadow-lg px-2">
+                  <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-6 w-auto" />
+                </div>
                 <div>
                   <div className="text-white font-bold text-[0.9375rem] leading-tight">Kalika ERP</div>
                   <div className="text-[0.625rem] text-slate-400">Enterprise Resource Mgmt</div>
@@ -302,14 +304,5 @@ export default function Layout() {
         </main>
       </div>
     </div>
-  )
-}
-
-function Factory2Icon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="text-slate-900">
-      <path d="M2 20a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8l-7 5V8l-7 5V4a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2Z" />
-      <path d="M17 18h1" /><path d="M12 18h1" /><path d="M7 18h1" />
-    </svg>
   )
 }

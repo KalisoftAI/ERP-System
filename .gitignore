@@ -39,5 +39,8 @@ export_*.xlsx
 .DS_Store
 Thumbs.db
 
+# Local working docs (reference only, not committed)
+frontend/docs/
+
 # Logs
 *.log
