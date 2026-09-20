@@ -1,7 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
-import { Plus, Pencil, RefreshCw, CalendarClock, Factory, GitCompareArrows, Trash2 } from 'lucide-react'
-import api from '../lib/api'
+import { Plus, Pencil, RefreshCw, CalendarClock, Factory, GitCompareArrows, Trash2, CheckCircle2, Upload, Download } from 'lucide-react'
+import api, { downloadFile } from '../lib/api'
 import { PageHeader, Card, Modal, Loading, Empty, Badge, PageTabs, StatCard, SearchSelect } from '../components/ui'
 import Table from '../components/Table'
 import { fmtNum, CompletionBar } from '../lib/format'
@@ -11,6 +11,32 @@ const TABS = [
   { key: 'actual', label: 'Actual Production', icon: <Factory size={15} /> },
   { key: 'pva', label: 'Plan vs Actual', icon: <GitCompareArrows size={15} /> },
 ]
+
+// ---- Month helpers (monthly schedule / date-wise actual filtering) ----
+const currentMonth = () => new Date().toISOString().slice(0, 7)
+const shiftMonth = (ym, delta) => {
+  const [y, m] = ym.split('-').map(Number)
+  const d = new Date(y, m - 1 + delta, 1)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+const monthRange = (ym) => {
+  if (!ym) return { from: '', to: '' }
+  const [y, m] = ym.split('-').map(Number)
+  const last = new Date(y, m, 0).getDate()
+  return { from: `${ym}-01`, to: `${ym}-${String(last).padStart(2, '0')}` }
+}
+
+function MonthFilter({ value, onChange }) {
+  return (
+    <div className="flex items-center gap-1.5 flex-wrap">
+      <button type="button" onClick={() => onChange(currentMonth())} className="btn btn-secondary !py-1 !px-2.5 text-xs">Current Month</button>
+      <button type="button" onClick={() => onChange(shiftMonth(currentMonth(), -1))} className="btn btn-secondary !py-1 !px-2.5 text-xs">Last Month</button>
+      <button type="button" onClick={() => onChange(shiftMonth(currentMonth(), 1))} className="btn btn-secondary !py-1 !px-2.5 text-xs">Next Month</button>
+      <input type="month" value={value} onChange={(e) => onChange(e.target.value)} className="input !w-auto !py-1 text-xs" title="Select month manually" />
+      {value && <button type="button" onClick={() => onChange('')} className="btn btn-secondary !py-1 !px-2.5 text-xs" title="Show all months">All</button>}
+    </div>
+  )
+}
 
 export default function Production() {
   const [searchParams, setSearchParams] = useSearchParams()
@@ -27,16 +53,31 @@ export default function Production() {
   const [showEditActual, setShowEditActual] = useState(false)
   const [editForm, setEditForm] = useState({})
   const [form, setForm] = useState({})
+  const [planMonth, setPlanMonth] = useState(currentMonth())
+  const [actualMonth, setActualMonth] = useState(currentMonth())
+  const [importOpen, setImportOpen] = useState(false)
+  const [importPreview, setImportPreview] = useState(null)
+  const [importError, setImportError] = useState('')
+  const [importConfirm, setImportConfirm] = useState(false)
+  const [importLoading, setImportLoading] = useState(false)
+  const [success, setSuccess] = useState('')
+  const fileInputRef = useRef(null)
 
   const loadProducts = () => api.get('/products', { params: { page_size: 500 } })
     .then((r) => setProducts(r.data.items || [])).catch(() => {})
   const loadCustomers = () => api.get('/customers', { params: { page_size: 500 } })
     .then((r) => setCustomers(r.data.items || [])).catch(() => {})
 
-  const loadPlans = () => api.get('/plans', { params: { plan_type: 'PRODUCTION_PLAN', page_size: 500 } })
-    .then((r) => setPlans(r.data.items || [])).catch(() => [])
-  const loadActual = () => api.get('/production/actual', { params: { page_size: 500 } })
-    .then((r) => setActual(r.data.items || [])).catch(() => [])
+  const loadPlans = () => {
+    const { from, to } = monthRange(planMonth)
+    return api.get('/plans', { params: { plan_type: 'PRODUCTION_PLAN', page_size: 500, ...(from ? { date_from: from, date_to: to } : {}) } })
+      .then((r) => setPlans(r.data.items || [])).catch(() => [])
+  }
+  const loadActual = () => {
+    const { from, to } = monthRange(actualMonth)
+    return api.get('/production/actual', { params: { page_size: 500, ...(from ? { date_from: from, date_to: to } : {}) } })
+      .then((r) => setActual(r.data.items || [])).catch(() => [])
+  }
   const loadPva = () => api.get('/production/plan-vs-actual')
     .then((r) => { setPva(r.data.items || []); setUnlinked(r.data.unlinked_plans || []) }).catch(() => [])
 
@@ -45,7 +86,9 @@ export default function Production() {
     return Promise.all([loadPlans(), loadActual(), loadPva()]).finally(() => setLoading(false))
   }
 
-  useEffect(() => { load(); loadProducts(); loadCustomers() }, [])
+  useEffect(() => { loadPva(); loadProducts(); loadCustomers(); setLoading(false) }, [])
+  useEffect(() => { loadPlans() }, [planMonth])
+  useEffect(() => { loadActual() }, [actualMonth])
 
   // "Go to Production" from a Local Order: open the New Plan modal, pre-filled
   // from the order (product + qty + customer), already linked back to the order
@@ -76,6 +119,13 @@ export default function Production() {
   }, [])
 
   const savePlan = () => {
+    // Duplicate safety: same product/model already scheduled in the selected month -> confirm first
+    if (!form.id) {
+      const dup = plans.find((p) =>
+        (form.product_id && p.product_id === form.product_id) ||
+        (!form.product_id && (p.model || '').trim().toLowerCase() === (form.model || '').trim().toLowerCase()))
+      if (dup && !window.confirm(`A schedule already exists for "${dup.model || dup.product?.model || ''}" in ${planMonth || 'the unfiltered view'} (Plan Date ${dup.plan_date}, Qty ${fmtNum(dup.quantity)}). Create another schedule anyway?`)) return
+    }
     const payload = {
       plan_type: 'PRODUCTION_PLAN', model: form.model || '',
       product_id: form.product_id || null, customer_id: form.customer_id || null,
@@ -105,15 +155,79 @@ export default function Production() {
       .catch((e) => alert('Delete failed: ' + (e.response?.data?.detail || e.message)))
   }
 
+  // ---- Production plan import (CSV / Excel, two-phase: preview -> import) ----
+  const openImport = () => { setImportOpen(true); setImportPreview(null); setImportError(''); setImportConfirm(false) }
+  const closeImport = () => {
+    setImportOpen(false); setImportPreview(null); setImportError(''); setImportConfirm(false); setImportLoading(false)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+  const handleImportFile = (e) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    setImportLoading(true); setImportError(''); setImportConfirm(false); setImportPreview(null)
+    const fd = new FormData()
+    fd.append('file', file)
+    api.post('/production/import-preview', fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      .then((res) => setImportPreview(res.data))
+      .catch((err) => {
+        const d = err?.response?.data?.detail
+        setImportError(typeof d === 'string' ? d : 'Preview failed. Please check the file format.')
+      })
+      .finally(() => setImportLoading(false))
+  }
+  const runImport = (force = false) => {
+    const file = fileInputRef.current?.files?.[0]
+    if (!file) return
+    if (importPreview?.duplicate_rows && !force) { setImportConfirm(true); return }
+    setImportLoading(true)
+    const fd = new FormData()
+    fd.append('file', file)
+    api.post(`/production/import?confirm_duplicates=${force ? 'true' : 'false'}`, fd, { headers: { 'Content-Type': 'multipart/form-data' } })
+      .then((res) => {
+        closeImport()
+        setSuccess(`Imported ${res.data.summary.created} production plan(s) from ${file.name} — visible in Plan vs Actual`)
+        setTimeout(() => setSuccess(''), 6000)
+        loadPva(); loadPlans()
+      })
+      .catch((err) => {
+        const d = err?.response?.data?.detail
+        if (typeof d === 'object' && d?.message && d?.duplicates) {
+          setImportConfirm(true)
+          setImportError(`${d.message} (${d.duplicates.length} duplicate(s))`)
+        } else {
+          setImportError(typeof d === 'string' ? d : 'Import failed. Please check the file and try again.')
+        }
+      })
+      .finally(() => setImportLoading(false))
+  }
+
+  const completePlan = (r) => {
+    if (!window.confirm(`Mark production plan for "${r.model || r.product?.model || ''}" as COMPLETED? Finished goods are posted to Main Store once (idempotent — no duplicate stock on repeat).`)) return
+    api.patch(`/plans/${r.id}`, { status: 'COMPLETED' })
+      .then(() => { loadPlans(); loadPva() })
+      .catch((e) => alert('Complete failed: ' + (e.response?.data?.detail || e.message)))
+  }
+
+  const completeProduction = (r) => {
+    if (!window.confirm(`Mark production "${r.model || ''}" as Completed? Status only — recorded output quantity and date-wise history stay unchanged.`)) return
+    api.patch(`/production/${r.plan_id}/complete`)
+      .then(() => { loadPva(); loadActual() })
+      .catch((e) => alert('Complete failed: ' + (e.response?.data?.detail || e.message)))
+  }
+
   const planCols = [
     { key: 'plan_date', label: 'Plan Date', render: (r) => r.plan_date || '—' },
+    { key: 'item_code', label: 'Item Code', render: (r) => <span className="font-mono text-xs">{r.product?.item_code || '—'}</span> },
     { key: 'customer', label: 'Customer', render: (r) => r.customer?.name || '—' },
-    { key: 'model', label: 'Product / Model', render: (r) => r.model || r.product?.model || '—' },
-    { key: 'quantity', label: 'Planned Qty', render: (r) => <span className="font-semibold">{fmtNum(r.quantity)}</span> },
+    { key: 'model', label: 'Model', render: (r) => r.model || r.product?.model || '—' },
+    { key: 'quantity', label: 'Schedule', render: (r) => <span className="font-semibold">{fmtNum(r.quantity)}</span> },
     { key: 'status', label: 'Status', render: (r) => <Badge className={sc[r.status]} dot>{r.status}</Badge> },
     { key: 'remarks', label: 'Remarks', render: (r) => <span className="text-slate-500 text-xs">{r.remarks || '—'}</span> },
     { key: 'edit', label: '', render: (r) => (
       <div className="flex items-center gap-0.5">
+        {(r.status || '').toUpperCase() !== 'COMPLETED' && (
+          <button onClick={(e) => { e.stopPropagation(); completePlan(r) }} className="text-slate-400 hover:text-green-600 p-1 hover:bg-green-50 rounded" title="Mark Production Complete"><CheckCircle2 size={15} /></button>
+        )}
         <button onClick={() => { setForm({ id: r.id, model: r.model, product_id: r.product_id, customer_id: r.customer_id, customer_name: r.customer_name || r.customer?.name || '', sales_order_id: r.sales_order_id, quantity: r.quantity, owner: r.owner, status: r.status, plan_date: r.plan_date, remarks: r.remarks }); setShowPlanForm(true) }} className="text-slate-400 hover:text-slate-700 p-1 hover:bg-gray-100 rounded" title="Edit"><Pencil size={15} /></button>
         <button onClick={(e) => { e.stopPropagation(); removePlan(r) }} className="text-slate-400 hover:text-red-600 p-1 hover:bg-red-50 rounded" title="Delete"><Trash2 size={14} /></button>
       </div>
@@ -135,16 +249,21 @@ export default function Production() {
   ]
 
   const pvaCols = [
-    { key: 'model', label: 'Product / Model', render: (r) => <span className="font-semibold">{r.model || '—'}</span> },
     { key: 'item_code', label: 'Item Code', render: (r) => <span className="font-mono text-xs">{r.item_code || '—'}</span> },
-    { key: 'planned_qty', label: 'Planned Qty', render: (r) => fmtNum(r.planned_qty) },
-    { key: 'actual_qty', label: 'Actual Produced', render: (r) => fmtNum(r.actual_qty) },
-    { key: 'remaining_qty', label: 'Remaining', render: (r) => <span className={r.remaining_qty < 0 ? 'text-red-600 font-semibold' : ''}>{fmtNum(r.remaining_qty)}</span> },
-    { key: 'completion_pct', label: 'Completion', render: (r) => <div className="min-w-36"><CompletionBar value={r.completion_pct} /></div> },
+    { key: 'model', label: 'Model', render: (r) => <span className="font-semibold">{r.model || '—'}</span> },
+    { key: 'planned_qty', label: 'Schedule', render: (r) => fmtNum(r.planned_qty) },
+    { key: 'actual_qty', label: 'Production Qty', render: (r) => fmtNum(r.actual_qty) },
+    { key: 'completion_pct', label: <span title="100% = Production Qty has reached or exceeded Schedule Qty.">% Comp</span>, render: (r) => <div className="min-w-36" title="100% = Production Qty has reached or exceeded Schedule Qty."><CompletionBar value={r.completion_pct} /></div> },
+    { key: 'remaining_qty', label: <span title="Negative balance means actual production is above the scheduled quantity.">Balance Qty</span>, render: (r) => <span className={r.remaining_qty < 0 ? 'text-red-600 font-semibold' : ''} title={r.remaining_qty < 0 ? 'Negative balance means actual production is above the scheduled quantity.' : undefined}>{fmtNum(r.remaining_qty)}</span> },
     { key: 'status', label: 'Status', render: (r) => <Badge className={sc[r.status]} dot>{r.status}</Badge> },
     { key: 'report_date', label: 'Report Date', render: (r) => r.report_date || '—' },
-    { key: 'delete', label: '', render: (r) => (
-      <button onClick={(e) => { e.stopPropagation(); removeProduction(r) }} className="text-slate-400 hover:text-red-600 p-1 hover:bg-red-50 rounded" title="Delete production order"><Trash2 size={14} /></button>
+    { key: 'actions', label: '', render: (r) => (
+      <div className="flex items-center gap-0.5">
+        {r.status !== 'Completed' && (
+          <button onClick={(e) => { e.stopPropagation(); completeProduction(r) }} className="text-slate-400 hover:text-green-600 p-1 hover:bg-green-50 rounded" title="Mark Production Complete"><CheckCircle2 size={14} /></button>
+        )}
+        <button onClick={(e) => { e.stopPropagation(); removeProduction(r) }} className="text-slate-400 hover:text-red-600 p-1 hover:bg-red-50 rounded" title="Delete production order"><Trash2 size={14} /></button>
+      </div>
     )},
   ]
 
@@ -169,11 +288,16 @@ export default function Production() {
         <div className="space-y-4">
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <StatCard label="Planned Records" value={plans.length} icon={CalendarClock} iconClass="bg-amber-50 text-amber-600" />
-            <StatCard label="Total Planned Qty" value={fmtNum(totalPlanned)} icon={Factory} iconClass="bg-violet-50 text-violet-600" />
+            <StatCard label="Total Scheduled Qty" value={fmtNum(totalPlanned)} icon={Factory} iconClass="bg-violet-50 text-violet-600" />
             <StatCard label="Customers" value={new Set(plans.map((p) => p.customer?.name || '').filter(Boolean)).size} icon={Factory} iconClass="bg-blue-50 text-blue-600" />
           </div>
-          <Card title="Production Plan" actions={
-            <button onClick={() => { setForm({}); setShowPlanForm(true) }} className="btn btn-primary"><Plus size={15} /> New Plan</button>
+          <Card title={`Monthly Production Schedule${planMonth ? ` — ${planMonth}` : ' — All months'}`} actions={
+            <div className="flex items-center gap-2 flex-wrap">
+              <MonthFilter value={planMonth} onChange={setPlanMonth} />
+              <button type="button" onClick={() => downloadFile('/production/import/template', 'production_import_template.csv')} className="btn btn-secondary" title="Download CSV import template"><Download size={15} /> Template</button>
+              <button type="button" onClick={openImport} className="btn btn-secondary"><Upload size={15} /> Import Production Plan</button>
+              <button onClick={() => { setForm({}); setShowPlanForm(true) }} className="btn btn-primary"><Plus size={15} /> New Plan</button>
+            </div>
           }>
             {loading ? <Loading /> : plans.length === 0 ? <Empty text="No production plans found" /> : <Table columns={planCols} data={plans} keyField="id" stickyColumns={['model']} />}
           </Card>
@@ -188,8 +312,11 @@ export default function Production() {
             <StatCard label="Total Actual Qty" value={fmtNum(totalActual)} icon={Factory} iconClass="bg-green-50 text-green-600" />
             <StatCard label="Days Tracked" value={new Set(actual.map((p) => p.production_date)).size} icon={CalendarClock} iconClass="bg-cyan-50 text-cyan-600" />
           </div>
-          <Card title="Actual Production (daily)" actions={
-            <button onClick={() => setShowActualForm(true)} className="btn btn-primary"><Plus size={15} /> Record Output</button>
+          <Card title={`Actual Production (date-wise)${actualMonth ? ` — ${actualMonth}` : ' — All months'}`} actions={
+            <div className="flex items-center gap-2 flex-wrap">
+              <MonthFilter value={actualMonth} onChange={setActualMonth} />
+              <button onClick={() => setShowActualForm(true)} className="btn btn-primary"><Plus size={15} /> Record Output</button>
+            </div>
           }>
             {loading ? <Loading /> : actual.length === 0 ? <Empty text="No actual output recorded" /> : <Table columns={actualCols} data={actual} keyField="id" stickyColumns={['model']} />}
           </Card>
@@ -228,6 +355,8 @@ export default function Production() {
 
       <PageTabs tabs={TABS} active={tab} onChange={setTab} />
 
+      {success && <div className="mb-3 rounded-lg bg-green-50 border border-green-200 text-green-700 text-sm px-3 py-2">{success}</div>}
+
       {renderTab()}
 
       {/* Plan create/edit modal */}
@@ -256,8 +385,8 @@ export default function Production() {
               placeholder="Type to search or enter a customer name — new customers are auto-created"
               onChange={(id, manual) => setForm((f) => ({ ...f, customer_id: id, customer_name: manual }))}
             /></div>
-          <div><label className="block text-slate-500 text-xs mb-1">Planned Qty</label>
-            <input type="number" value={form.quantity ?? ''} onChange={(e) => setForm({ ...form, quantity: e.target.value })} className="input" /></div>
+          <div><label className="block text-slate-500 text-xs mb-1">Schedule Qty</label>
+            <input type="number" value={form.quantity ?? ''} onChange={(e) => setForm({ ...form, quantity: e.target.value })} className="input input-num" /></div>
           <div><label className="block text-slate-500 text-xs mb-1">Owner / Salesperson</label>
             <input value={form.owner || ''} onChange={(e) => setForm({ ...form, owner: e.target.value })} className="input" /></div>
           <div><label className="block text-slate-500 text-xs mb-1">Plan Date</label>
@@ -313,6 +442,109 @@ export default function Production() {
             <input type="date" value={editForm.production_date || ''} onChange={(e) => setEditForm({ ...editForm, production_date: e.target.value })} className="input" /></div>
         </div>
       </Modal>
+
+      {/* Hidden file input for production plan import */}
+      <input ref={fileInputRef} type="file" accept=".csv,.xlsx,.xls" className="hidden" onChange={handleImportFile} />
+
+      {/* Import production plan modal */}
+      <Modal open={importOpen} title="Import Production Plan" onClose={closeImport} xwide
+        footer={<>
+          <button onClick={closeImport} className="btn btn-secondary" disabled={importLoading}>Cancel</button>
+          {importPreview?.can_import && (
+            <button onClick={() => runImport(importConfirm)} disabled={importLoading} className="btn btn-primary">
+              {importLoading ? 'Importing…' : (importConfirm ? 'Import Anyway' : 'Import Production Plans')}
+            </button>
+          )}
+        </>}>
+        <div className="space-y-4 text-sm">
+          <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-gray-100 flex-wrap">
+            <button type="button" onClick={() => fileInputRef.current?.click()} className="btn btn-secondary" disabled={importLoading}><Upload size={14} /> Select File</button>
+            <span className="text-slate-500">{fileInputRef.current?.files?.[0]?.name || importPreview?.file_name || 'CSV or Excel (.xlsx, .xls)'}</span>
+            <button type="button" onClick={() => downloadFile('/production/import/template', 'production_import_template.csv')} className="btn btn-secondary ml-auto"><Download size={14} /> Template</button>
+          </div>
+
+          {importLoading && <Loading text="Analysing file…" />}
+
+          {importError && (
+            <div className="rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2">{importError}</div>
+          )}
+
+          {importPreview && (
+            <>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="bg-white border border-gray-100 rounded-lg p-3"><div className="text-xs text-slate-500">Total Rows</div><div className="text-lg font-semibold">{importPreview.total_rows}</div></div>
+                <div className="bg-white border border-gray-100 rounded-lg p-3"><div className="text-xs text-slate-500">Valid Rows</div><div className="text-lg font-semibold text-green-700">{importPreview.valid_rows}</div></div>
+                <div className="bg-white border border-gray-100 rounded-lg p-3"><div className="text-xs text-slate-500">Errors</div><div className="text-lg font-semibold text-red-600">{importPreview.error_rows}</div></div>
+                <div className="bg-white border border-gray-100 rounded-lg p-3"><div className="text-xs text-slate-500">Warnings</div><div className="text-lg font-semibold text-amber-600">{importPreview.warning_rows + (importPreview.duplicate_rows || 0)}</div></div>
+              </div>
+
+              {importPreview.duplicate_rows > 0 && (
+                <div className="rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-sm px-3 py-2">
+                  {importPreview.duplicate_rows} row(s) match production plans already created this month. Click <b>Import Anyway</b> to create them regardless, or cancel and review the source file.
+                </div>
+              )}
+
+              <div>
+                <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Detected Columns</div>
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(importPreview.mapped_columns || {}).map(([k, v]) => (
+                    <Badge key={k} className="bg-slate-100 text-slate-700">{k} <span className="text-slate-400">→ {v}</span></Badge>
+                  ))}
+                </div>
+              </div>
+
+              {importPreview.sample_rows?.length > 0 && (
+                <div>
+                  <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Preview Rows</div>
+                  <div className="table-wrap max-h-72">
+                    <table className="data-table">
+                      <thead>
+                        <tr>
+                          <th className="text-left">Row</th>
+                          <th className="text-left">Item Code</th>
+                          <th className="text-left">Model</th>
+                          <th className="text-right">Schedule</th>
+                          <th className="text-right">Production Qty</th>
+                          <th className="text-left">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {importPreview.sample_rows.map((r, i) => (
+                          <tr key={i} className={r.errors?.length ? 'bg-red-50' : r.warnings?.length || r.duplicate_of ? 'bg-amber-50' : ''}>
+                            <td>{r.row}</td>
+                            <td className="font-mono text-xs">{r.item_code || '—'}</td>
+                            <td>{r.model || '—'}</td>
+                            <td className="text-right">{fmtNum(r.schedule_qty)}</td>
+                            <td className="text-right">{fmtNum(r.produced_qty)}</td>
+                            <td>
+                              {r.errors?.length ? <Badge className="bg-red-100 text-red-700">{r.errors.length} error(s)</Badge> :
+                                r.warnings?.length || r.duplicate_of ? <Badge className="bg-amber-100 text-amber-700">{r.warnings?.length ? `${r.warnings.length} warn` : ''} {r.duplicate_of ? 'dup' : ''}</Badge> :
+                                  <Badge className="bg-green-100 text-green-700">{r.status || 'Planned'}</Badge>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {importPreview.errors?.length > 0 && (
+                <div>
+                  <div className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">Errors</div>
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {importPreview.errors.slice(0, 20).map((e, i) => (
+                      <div key={i} className="text-xs bg-red-50 border border-red-100 rounded px-2 py-1.5 text-red-700">
+                        Row {e.row}: {e.errors?.join('; ')}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </Modal>
     </div>
   )
 }
@@ -321,7 +553,9 @@ const sc = {
   PENDING: 'bg-amber-100 text-amber-700',
   IN_PROCESS: 'bg-blue-100 text-blue-700',
   'In Process': 'bg-blue-100 text-blue-700',
+  'In Production': 'bg-blue-100 text-blue-700',
   COMPLETED: 'bg-green-100 text-green-700',
   Completed: 'bg-green-100 text-green-700',
   Planned: 'bg-slate-100 text-slate-600',
+  Cancelled: 'bg-red-100 text-red-700',
 }
