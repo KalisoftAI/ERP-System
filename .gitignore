@@ -42,5 +42,15 @@ Thumbs.db
 # Local working docs (reference only, not committed)
 frontend/docs/
 
+# Local sample data + branch-only docs (kept local; canonical copy lives in the
+# sales app branch docs/gcs-kpi-packaging-and-mcp-local)
+backend/docs/GCS_PACKAGING_KPI_DATA_PIPELINE.md
+backend/docs/MCP_POLYMER_PRICE_CALCULATOR.md
+backend/docs/quote_processing_pipeline_jabil_amber.md
+backend/docs/quote_processing_pipeline_jabil_amber.xlsx
+backend/docs/gcs_data_inventory.xlsx
+backend/docs/sample_data/
+backend/docs/local/
+
 # Logs
 *.log
