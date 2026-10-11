@@ -165,4 +165,59 @@ The `_line_total()` helper in `purchases.py` (commit `94c746b`) computes this on
 
 ---
 
-*Documentation generated from git history analysis of commits between `dc36831` (project complete) and `ba5269a` (quotation refresh fix), September–October 2026.*
+## 5. Sample Data Updates (New User Onboarding)
+
+New users get a self-contained set of reference data so every screen has
+something realistic to show before any production records exist.
+
+| Sample set | File(s) | What it demonstrates |
+|------------|---------|----------------------|
+| Quote-processing pipeline (Jabil / Amber) | `quote_processing_pipeline_jabil_amber.md`, `.xlsx` | End-to-end RFQ → quote → follow-up stages for two real customers |
+| Packaging & stretch-film leads | `packaging_business_leads_and_workflow.md` | 20 inbound leads, product/requirement summary, enquiry-to-completion workflow |
+| GCS KPI data inventory | `gcs_data_inventory.xlsx` | Source objects, row counts and the packaging/KPI pipeline mapping |
+| ERP workbook | `Kalika_ERP.xlsx` | Master module/field reference used by the UI |
+
+Onboarding usage:
+- New users start from the sample sets above; they are **read-only examples**,
+  kept apart from real quotations and leads.
+- The sample flows mirror the live module workflow (customer → quotation → PDF →
+  email, and enquiry → quote → follow-up) so a new user can rehearse the process.
+- Sample data can be cleared in one action once real records are entered.
+
+---
+
+## 6. Future Scope — UI for Latest Update Progress
+
+A dedicated **"What's new / Update progress"** surface is planned so users can
+see what shipped and what is coming without reading commit history.
+
+```
+ +------------------------------------------------------------------+
+ |  Release Progress                          last synced: today     |
+ +------------------------------------------------------------------+
+ |  Shipped                                                          |
+ |   [####------] Quotation Management      v  (draft->sent->accept)|
+ |   [########--] Purchase GST & Discount   v                       |
+ |   [######----] Production Auto-Status    v                       |
+ |                                                                   |
+ |  In progress                                                      |
+ |   [###-------] Packaging KPI dashboard   ~ Q4 2026               |
+ |   [##--------] GCS data pipeline         ~ Q4 2026               |
+ |                                                                   |
+ |  Planned                                                          |
+ |   [----------] MCP polymer price calc    TBD                      |
+ +------------------------------------------------------------------+
+```
+
+Planned capabilities:
+- **Timeline view** of merged changes grouped by module, kept in sync with this
+  changes document so the UI and the docs never drift.
+- **Progress bars** per module driven by a small status file
+  (shipped / in-progress / planned) instead of hard-coded values.
+- **In-app changelog** with filters (module, date, author) and deep links to the
+  affected page.
+- **Read-only for all roles**; only maintainers can edit status entries.
+
+---
+
+*Documentation generated from git history analysis of commits between `dc36831` (project complete) and `ba5269a` (quotation refresh fix), September–October 2026. Updated with sample-data onboarding and update-progress UI scope.*
