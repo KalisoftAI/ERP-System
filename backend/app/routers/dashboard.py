@@ -57,9 +57,12 @@ def summary(
     po_value = db.scalar(select(func.coalesce(func.sum(PurchaseOrder.total_amount), 0)).select_from(PurchaseOrder)) or 0
 
     disp = db.scalars(select(Dispatch)).all()
-    disp_sched = sum(d.schedule_qty for d in disp)
+    # Schedule de-duplicated by order line: an order line shipped over several
+    # dispatches contributes its schedule once, never per dispatch.
+    from ..services.dispatch_calc import aggregate_schedule
+    disp_sched = aggregate_schedule(db, disp)
     disp_done = sum(d.dispatched_qty for d in disp)
-    disp_pending = sum(d.balance_qty for d in disp)
+    disp_pending = disp_sched - disp_done
 
     supplier_count = db.scalar(select(func.count()).select_from(Supplier)) or 0
     customer_count = db.scalar(select(func.count()).select_from(Customer)) or 0
@@ -86,15 +89,19 @@ def summary(
 
 @router.get("/dispatch-by-plant")
 def dispatch_by_plant(db: Annotated[Session, Depends(get_db)], _: CurrentUser):
+    from ..services.dispatch_calc import aggregate_schedule
     rows = db.scalars(select(Dispatch)).all()
-    by = {}
+    by: dict = {}
     for d in rows:
         key = d.plant.name if d.plant else (d.customer.name if d.customer else "Unknown")
-        e = by.setdefault(key, {"scheduled": 0.0, "dispatched": 0.0, "pending": 0.0})
-        e["scheduled"] += d.schedule_qty
-        e["dispatched"] += d.dispatched_qty
-        e["pending"] += d.balance_qty
-    items = [{"plant": k, **v} for k, v in sorted(by.items(), key=lambda x: -x[1]["scheduled"])]
+        by.setdefault(key, []).append(d)
+    items = []
+    for k, ds in sorted(by.items(), key=lambda x: -len(x[1])):
+        sched = aggregate_schedule(db, ds)
+        done = sum(float(d.dispatched_qty or 0) for d in ds)
+        items.append({"plant": k, "scheduled": sched, "dispatched": done,
+                      "pending": sched - done})
+    items.sort(key=lambda x: -x["scheduled"])
     return {"items": items}
 
 

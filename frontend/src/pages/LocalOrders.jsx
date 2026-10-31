@@ -23,6 +23,8 @@ const errText = (err) => {
 export default function LocalOrders() {
   const [rows, setRows] = useState([])
   const [completedTotal, setCompletedTotal] = useState(0)
+  const [completedRows, setCompletedRows] = useState([])
+  const [completedLoading, setCompletedLoading] = useState(false)
   const [plans, setPlans] = useState([])
   const [loading, setLoading] = useState(true)
   const [customers, setCustomers] = useState([])
@@ -60,8 +62,35 @@ export default function LocalOrders() {
 
   const flash = (text) => { setSuccess(text); setTimeout(() => setSuccess(''), 6000) }
 
+  // Completed orders: the status filter is applied after pagination on the
+  // backend, so page through until every local-order row has been seen.
+  const loadCompleted = () => {
+    setCompletedLoading(true)
+    const collected = []
+    let page = 1
+    let total = null
+    const step = () => {
+      api.get('/local-orders', { params: { page_size: 500, page, status: 'completed' } })
+        .then((res) => {
+          const data = res.data || {}
+          if (total == null) total = Number(data.total || 0)
+          collected.push(...(data.items || []))
+          if (page * 500 >= total) {
+            setCompletedRows(collected)
+            setCompletedLoading(false)
+            return
+          }
+          page += 1
+          step()
+        })
+        .catch(() => { setCompletedRows(collected); setCompletedLoading(false) })
+    }
+    step()
+  }
+
   const load = () => {
     setLoading(true)
+    loadCompleted()
     api.get('/local-orders', { params: { page_size: 500, active_only: true } })
       .then((res) => {
         setRows(res.data.items || [])
@@ -583,6 +612,20 @@ export default function LocalOrders() {
     { key: 'status', label: 'Status', render: (r) => <StatusBadge status={r.status} /> },
   ]
 
+  const completedCols = [
+    { key: 'order_no', label: 'Order', render: (r) => <span className="font-mono text-xs font-medium">{r.order_no || '—'}</span> },
+    { key: 'customer', label: 'Customer', render: (r) => <span className="font-medium">{r.customer || '—'}</span> },
+    { key: 'product', label: 'Product', render: (r) => {
+      const first = (r.lines || [])[0]
+      return <span className="text-xs block max-w-40 truncate">{first?.description || first?.model || '—'}{(r.lines?.length || 0) > 1 ? ` +${r.lines.length - 1}` : ''}</span>
+    } },
+    { key: 'quantity', label: 'Qty', render: (r) => fmtNum(r.quantity) },
+    { key: 'dispatched_qty', label: 'Dispatched', render: (r) => <span className="font-medium">{fmtNum(r.dispatched_qty)}</span> },
+    { key: 'order_date', label: 'Order Date', render: (r) => r.order_date || '—' },
+    { key: 'total_value', label: 'Amount', render: (r) => <span className="font-mono text-xs font-medium">{fmtNum(r.total_value)}</span> },
+    { key: 'status', label: 'Status', render: (r) => <StatusBadge status={r.status} /> },
+  ]
+
   const detailLineCols = [
     { key: 'description', label: 'Size / Description', render: (r) => <span className="font-medium">{r.description || r.model || '—'}</span> },
     { key: 'item_code', label: 'Item Code', render: (r) => <span className="font-mono text-xs">{r.item_code || '—'}</span> },
@@ -683,11 +726,11 @@ export default function LocalOrders() {
         {filteredRows.length === 0 ? <Empty text={search ? 'No matching local orders' : 'No active local orders'} /> : <Table columns={orderCols} data={filteredRows} keyField="id" onRowClick={openDetail} stickyColumns={['order_no']} dense />}
       </Card>
 
-      <Card title="Completed Local Orders" subtitle="Historical completed-order report for records / invoicing" className="mb-6"
+      <Card title="Completed Local Orders" subtitle={`${completedTotal} completed order(s) — historical records for reference / invoicing`} className="mb-6"
         actions={<button onClick={() => downloadFile('/local-orders/report/orders', 'local_orders_completed.csv')} className="btn btn-secondary btn-sm"><Download size={13} /> Download CSV</button>}>
-        <div className="text-sm text-slate-500">
-          {completedTotal} completed local order(s). The active list above shows {filteredRows.length} in-progress order(s). Download the full completed-order history (CSV).
-        </div>
+        {completedLoading ? <Loading /> : completedRows.length === 0
+          ? <Empty text="No completed local orders" />
+          : <Table columns={completedCols} data={completedRows} keyField="id" onRowClick={openDetail} stickyColumns={['order_no']} dense />}
       </Card>
 
       <Card title="Production / Dispatch Plans (Local)" subtitle="Production & dispatch plans with linked order, production and dispatch progress"

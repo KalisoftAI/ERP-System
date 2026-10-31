@@ -23,6 +23,7 @@ from ..models import (
     Dispatch, DispatchLine, Inventory, OrderStatus, OrderType, Plant, ProductionOrder,
     ProductionStatus, SalesOrder, SalesOrderLine,
 )
+from .dispatch_calc import order_line_remaining as _calc_order_line_remaining
 
 LOCAL_TYPES = ("TRADING", "MANUFACTURING")
 DEFAULT_LOCAL_TYPE = "TRADING"
@@ -137,20 +138,12 @@ def order_line_remaining(db: Session, order_line_id: int | None,
     entries without a sales_order_line_id are not balance-constrained).
     `exclude_*` let an in-progress edit discount its own entry.
     """
-    if order_line_id is None:
-        return None
-    qty = db.scalar(select(SalesOrderLine.quantity)
-                    .where(SalesOrderLine.id == order_line_id))
-    if qty is None:
-        return None
-    stmt = (select(func.coalesce(func.sum(DispatchLine.quantity), 0))
-            .where(DispatchLine.sales_order_line_id == order_line_id))
-    if exclude_dispatch_id is not None:
-        stmt = stmt.where(DispatchLine.dispatch_id != exclude_dispatch_id)
-    if exclude_line_id is not None:
-        stmt = stmt.where(DispatchLine.id != exclude_line_id)
-    dispatched = db.scalar(stmt) or 0
-    return float(qty) - float(dispatched)
+    # Canonical implementation lives in services.dispatch_calc and is
+    # schedule-aware (SalesOrderLine.schedule_qty ?? quantity). Local order
+    # lines have no explicit schedule_qty, so behaviour is unchanged for them.
+    return _calc_order_line_remaining(db, order_line_id,
+                                      exclude_dispatch_id=exclude_dispatch_id,
+                                      exclude_line_id=exclude_line_id)
 
 
 def check_ready(db: Session, o: SalesOrder) -> dict:

@@ -769,6 +769,10 @@ class DispatchLine(Base):
     sales_order_line_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     quantity: Mapped[float] = mapped_column(Float, default=0)
+    # Product-wise scheduled quantity for THIS line, derived from the linked
+    # order line (SalesOrderLine.schedule_qty ?? quantity) at write time. NULL on
+    # legacy rows that cannot be mapped reliably — preserved for manual review.
+    schedule_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
     dispatch_date: Mapped[date] = mapped_column(Date, index=True)
     rate: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     weight: Mapped[float | None] = mapped_column(Float, nullable=True)

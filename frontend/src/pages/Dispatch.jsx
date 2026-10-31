@@ -18,16 +18,24 @@ const today = () => new Date().toISOString().slice(0, 10)
 
 const blankLine = () => ({ product_id: '', item_code: '', description: '', quantity: '', dispatch_date: today(), rate: '', weight: '', sales_order_line_id: null, schedule_qty: '' })
 
-const orderLinesToLines = (order) => (order?.lines || []).map((ln) => ({
-  product_id: ln.product_id ?? '',
-  item_code: ln.item_code || ln.product?.item_code || '',
-  description: ln.description || ln.product?.model || '',
-  quantity: ln.quantity ?? '',
-  dispatch_date: today(),
-  rate: '', weight: '',
-  sales_order_line_id: ln.id ?? null,
-  schedule_qty: ln.quantity ?? '',
-}))
+const orderLinesToLines = (order, orderLineDetails = []) => {
+  const map = Object.fromEntries((orderLineDetails || []).map((x) => [x.sales_order_line_id, x]))
+  return (order?.lines || []).map((ln) => {
+    const d = map[ln.id]
+    const sched = d?.schedule_qty ?? ln.schedule_qty ?? ln.balance_qty ?? ln.quantity ?? ''
+    return {
+      product_id: ln.product_id ?? d?.product_id ?? '',
+      item_code: ln.item_code || ln.product?.item_code || d?.item_code || '',
+      description: ln.description || ln.product?.model || d?.description || '',
+      quantity: ln.quantity ?? '',
+      dispatch_date: today(),
+      rate: ln.rate ?? d?.rate ?? '',
+      weight: '',
+      sales_order_line_id: ln.id ?? null,
+      schedule_qty: sched,
+    }
+  })
+}
 
 export default function Dispatch() {
   const [tab, setTab] = useState('dispatches')
@@ -548,7 +556,20 @@ export default function Dispatch() {
     { key: 'dispatch_date', label: 'Date', render: (r) => <span className="font-medium">{r.dispatch_date}</span> },
     { key: 'product', label: 'Product', render: (r) => <span className="font-medium">{r.product?.model || r.description || '—'}</span> },
     { key: 'item_code', label: 'Item Code', render: (r) => <span className="font-mono text-xs">{r.product?.item_code || '—'}</span> },
-    { key: 'quantity', label: 'Qty', render: (r) => <span className="font-semibold">{fmtNum(r.quantity)}</span> },
+    { key: 'schedule_qty', label: 'Schedule', render: (r) => r.schedule_qty != null ? fmtNum(r.schedule_qty) : '—' },
+    { key: 'quantity', label: 'Qty Dispatched', render: (r) => <span className="font-semibold">{fmtNum(r.quantity)}</span> },
+    { key: 'dispatched_total', label: 'Cumulative', render: (r) => r.dispatched_total != null ? fmtNum(r.dispatched_total) : '—' },
+    { key: 'balance_qty', label: 'Balance', render: (r) => r.balance_qty == null ? '—' : (
+      r.balance_qty < 0 ? <Badge className="bg-red-100 text-red-700" dot>OVER · {fmtNum(r.balance_qty)}</Badge>
+        : <span className={r.balance_qty <= 0 ? 'text-green-600 font-medium' : 'font-medium'}>{fmtNum(r.balance_qty)}</span>
+    )},
+    { key: 'completion_pct', label: 'Line %', render: (r) => {
+      if (r.completion_pct == null) return '—'
+      const pct = (r.completion_pct * 100).toFixed(1)
+      const cls = r.completion_pct >= 1 ? 'text-green-700 bg-green-100' : r.completion_pct > 0 ? 'text-amber-700 bg-amber-100' : 'text-slate-500 bg-slate-100'
+      return <Badge className={cls}>{pct}%</Badge>
+    }},
+    { key: 'line_status', label: 'Line Status', render: (r) => r.line_status ? <StatusBadge status={r.line_status} /> : (r.status ? <StatusBadge status={r.status} /> : '—') },
     { key: 'rate', label: 'Rate', render: (r) => r.rate != null ? fmtNum(r.rate) : '—' },
     { key: 'weight', label: 'Weight', render: (r) => r.weight != null ? fmtNum(r.weight) : '—' },
     { key: 'actions', label: '', render: (r) => (
@@ -888,9 +909,56 @@ export default function Dispatch() {
                   ...f, sales_order_id: id,
                   customer_id: f.customer_id || o?.customer_id || null,
                   customer_name: (!f.customer_id && o?.customer?.name) || f.customer_name || '',
-                  schedule_qty: f.schedule_qty || o?.lines?.reduce((s, l) => s + (l.quantity || 0), 0) || 0,
-                  lines: (id && o && !f.id) ? orderLinesToLines(o) : f.lines,
                 }))
+                if (id && o && !dispForm?.id) {
+                  api.get(`/dispatch/order-lines/${id}`)
+                    .then((r) => {
+                      const details = r.data.items || []
+                      const sched = details.reduce((s, l) => s + (Number(l.schedule_qty) || 0), 0)
+                      setDispForm((f) => (f?.sales_order_id === id ? {
+                        ...f,
+                        schedule_qty: f.schedule_qty || sched || 0,
+                        lines: orderLinesToLines(o, details),
+                      } : f))
+                    })
+                    .catch(() => {
+                      setDispForm((f) => (f?.sales_order_id === id ? {
+                        ...f,
+                        schedule_qty: f.schedule_qty || o?.lines?.reduce((s, l) => s + (Number(l.schedule_qty) || Number(l.quantity) || 0), 0) || 0,
+                        lines: orderLinesToLines(o),
+                      } : f))
+                    })
+                } else if (id && o && dispForm?.id) {
+                  setDispForm((f) => ({
+                    ...f,
+                    schedule_qty: f.schedule_qty || o?.lines?.reduce((s, l) => s + (Number(l.quantity) || 0), 0) || 0,
+                  }))
+                }
+      if (id && o && !dispForm?.id) {
+        // Fetch product-wise schedules from the order (order-line derived)
+        api.get(`/dispatch/order-lines/${id}`)
+          .then((r) => {
+            const details = r.data.items || []
+            const sched = details.reduce((s, l) => s + (Number(l.schedule_qty) || 0), 0)
+            setDispForm((f) => (f?.sales_order_id === id ? {
+              ...f,
+              schedule_qty: f.schedule_qty || sched || 0,
+              lines: orderLinesToLines(o, details),
+            } : f))
+          })
+          .catch(() => {
+            setDispForm((f) => (f?.sales_order_id === id ? {
+              ...f,
+              schedule_qty: f.schedule_qty || o?.lines?.reduce((s, l) => s + (Number(l.schedule_qty) || Number(l.quantity) || 0), 0) || 0,
+              lines: orderLinesToLines(o),
+            } : f))
+          })
+      } else if (id && o && dispForm?.id) {
+        setDispForm((f) => ({
+          ...f,
+          schedule_qty: f.schedule_qty || o?.lines?.reduce((s, l) => s + (Number(l.quantity) || 0), 0) || 0,
+        }))
+      }
               }} className="input">
                 <option value="">No order (manual dispatch)</option>
                 {orders.map((o) => <option key={o.id} value={o.id}>{o.order_no} — {o.customer?.name || o.customer_name}</option>)}

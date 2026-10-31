@@ -16,7 +16,11 @@ from ..models import (
 from ..schemas import DispatchCreate, DispatchLineIn, DispatchUpdate
 from ..services.business import sync_purchase_shortages
 from ..services.customers import get_or_create_customer
-from ..services.local_orders import order_line_remaining
+from ..services.dispatch_calc import (
+    aggregate_schedule, effective_dispatch_schedule, line_dispatched_total,
+    line_progress, order_line_remaining, order_line_schedule,
+    resolve_line_schedule,
+)
 from ..services.reorder_alerts import refresh_reorder_alert
 from ..services.stock_service import (
     apply_movement, ensure_available_stock, reconvert_document,
@@ -38,12 +42,22 @@ def _serialize_dispatch(db: Session, d: Dispatch) -> dict:
     plant = d.plant
     lines = []
     for ln in d.lines:
+        # Product-wise progress: schedule is this line's own (order-line
+        # derived); dispatched is the cumulative total for the linked order
+        # line across ALL dispatches. Balance/%/status follow per line.
+        cum_dispatched = line_dispatched_total(db, ln)
+        prog = line_progress(ln.schedule_qty, cum_dispatched)
         lines.append({
             "id": ln.id, "product_id": ln.product_id, "description": ln.description,
             "quantity": ln.quantity, "dispatch_date": ln.dispatch_date,
             "rate": float(ln.rate) if ln.rate is not None else None,
             "weight": ln.weight,
             "sales_order_line_id": ln.sales_order_line_id,
+            "schedule_qty": float(ln.schedule_qty) if ln.schedule_qty is not None else None,
+            "dispatched_total": cum_dispatched,
+            "balance_qty": prog["balance_qty"],
+            "completion_pct": prog["completion_pct"],
+            "line_status": prog["status"],
             "product": {"id": ln.product.id, "model": ln.product.model,
                         "item_code": ln.product.item_code, "category": ln.product.category.value} if ln.product else None,
         })
@@ -91,23 +105,27 @@ def dispatch_summary(
     if date_to:
         stmt = stmt.where(Dispatch.report_date <= date.fromisoformat(date_to))
     rows = db.scalars(stmt).all()
-    by = {}
+    by: dict = {}
+    names: dict = {}
     for d in rows:
-        key = d.customer_id
-        e = by.setdefault(key, {"customer_id": key,
-                                "customer": (d.customer.name if d.customer else None),
-                                "total_schedule": 0.0, "total_dispatched": 0.0,
-                                "total_balance": 0.0, "count": 0})
-        e["total_schedule"] += d.schedule_qty or 0
-        e["total_dispatched"] += d.dispatched_qty or 0
-        e["total_balance"] += d.balance_qty or 0
-        e["count"] += 1
+        by.setdefault(d.customer_id, []).append(d)
+        names[d.customer_id] = d.customer.name if d.customer else None
     items = []
-    for e in by.values():
-        sched = e["total_schedule"]
-        e["completion_pct"] = round(e["total_dispatched"] / sched, 4) if sched else 0.0
-        e["over_dispatched"] = e["total_balance"] < 0
-        items.append(e)
+    for cid, ds in by.items():
+        # Schedule is de-duplicated by order line: the same order line shipped
+        # over multiple dispatches contributes its schedule exactly once.
+        sched = aggregate_schedule(db, ds)
+        disp = sum(float(d.dispatched_qty or 0) for d in ds)
+        items.append({
+            "customer_id": cid,
+            "customer": names[cid],
+            "total_schedule": sched,
+            "total_dispatched": disp,
+            "total_balance": sched - disp,
+            "count": len(ds),
+            "completion_pct": round(disp / sched, 4) if sched else 0.0,
+            "over_dispatched": (sched - disp) < 0,
+        })
     items.sort(key=lambda x: (x["customer"] or "ZZZ").lower())
     return {"items": items, "total": len(items)}
 
@@ -133,6 +151,8 @@ def dispatch_by_customer(
                               .where(SalesOrderLine.order_id == d.sales_order_id)
                               .where(SalesOrderLine.customer_po_no != "").limit(1)) or ""
         for ln in d.lines:
+            cum = line_dispatched_total(db, ln)
+            prog = line_progress(ln.schedule_qty, cum)
             items.append({
                 "dispatch_id": d.id, "line_id": ln.id,
                 "dispatch_no": d.dispatch_no,
@@ -140,8 +160,14 @@ def dispatch_by_customer(
                 "description": ln.description,
                 "model": ln.product.model if ln.product else None,
                 "item_code": ln.product.item_code if ln.product else (ln.description or ""),
-                "schedule_qty": d.schedule_qty,
+                # Product-wise schedule for THIS line (order-line derived); the
+                # legacy header value is no longer repeated on every line.
+                "schedule_qty": float(ln.schedule_qty) if ln.schedule_qty is not None else None,
                 "dispatch_qty": ln.quantity,
+                "dispatched_total": cum,
+                "line_balance_qty": prog["balance_qty"],
+                "line_completion_pct": prog["completion_pct"],
+                "line_status": prog["status"],
                 "company_qty": d.dispatched_qty,
                 "completion_pct": d.completion_pct,
                 "balance_qty": d.balance_qty,
@@ -165,6 +191,19 @@ def _recalc_status(d: Dispatch):
         d.status = DispatchStatus.partial
     else:
         d.status = DispatchStatus.pending
+
+
+def _recalc_header(db: Session, d: Dispatch):
+    """Keep the dispatch header consistent with its lines.
+
+    dispatched_qty is always the sum of actual line quantities. schedule_qty
+    becomes the sum of the lines' product-wise schedules — but only when EVERY
+    current line carries a schedule, so a partially-mapped legacy dispatch
+    never loses its preserved header value."""
+    d.dispatched_qty = sum(float(l.quantity or 0) for l in d.lines)
+    if d.lines and all(l.schedule_qty is not None for l in d.lines):
+        d.schedule_qty = float(sum(float(l.schedule_qty) for l in d.lines))
+    _recalc_status(d)
 
 
 def _sync_sales_order(db: Session, d: Dispatch):
@@ -233,22 +272,32 @@ def _resolve_line_product(db: Session, ln) -> Product | None:
                                      allow_blank=True)
 
 
-def _resolve_dispatch_lines(db: Session, raw_lines) -> list[DispatchLine]:
+def _resolve_dispatch_lines(db: Session, raw_lines,
+                            sales_order_id: int | None = None) -> list[DispatchLine]:
     """Validate + resolve dispatch lines into row objects. Manual lines with an
-    Item Code are matched/created lazily so user-typed items stay stock-trackable."""
+    Item Code are matched/created lazily so user-typed items stay stock-trackable.
+
+    Every line also gets its own product-wise schedule: the linked order line's
+    schedule (schedule_qty ?? quantity), an explicit per-line value when given,
+    or the dispatched quantity itself for standalone manual lines."""
     rows = []
     for ln in raw_lines:
         if float(ln.quantity or 0) < 0:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
                                 detail="Dispatch quantity cannot be negative")
         product = _resolve_line_product(db, ln)
+        sched = resolve_line_schedule(db, sales_order_id,
+                                      product.id if product else None,
+                                      ln.sales_order_line_id,
+                                      getattr(ln, "schedule_qty", None))
         rows.append(DispatchLine(
             product_id=product.id if product else None,
             description=(ln.description or "").strip(),
             quantity=float(ln.quantity or 0),
             dispatch_date=ln.dispatch_date,
             rate=ln.rate, weight=ln.weight,
-            sales_order_line_id=ln.sales_order_line_id))
+            sales_order_line_id=ln.sales_order_line_id,
+            schedule_qty=sched if sched is not None else float(ln.quantity or 0)))
     return rows
 
 
@@ -264,8 +313,9 @@ def _require_available_stock(db: Session, d: Dispatch, added: list[DispatchLine]
     stale balance. This applies to Standard / Manufacture / Trading AND Local
     order dispatches (Local Orders simply draw from the Dispatch location).
 
-    The existing Local Order BALANCE guard is preserved unchanged: never
-    dispatch more than the remaining quantity on the linked order line.
+    The order-line BALANCE guard applies to any order-linked line (Standard and
+    Local orders alike): never dispatch more than the remaining schedule on the
+    linked order line, computed against the line's own product-wise schedule.
     """
     plant_id = d.plant_id
     totals: dict[int, float] = {}
@@ -275,11 +325,10 @@ def _require_available_stock(db: Session, d: Dispatch, added: list[DispatchLine]
     for pid in sorted(totals):
         ensure_available_stock(db, pid, plant_id, totals[pid],
                                context=f"dispatch {d.dispatch_no or 'stock out'}")
-    # Balance guard (LOCAL orders only, unchanged rule).
-    if not d.sales_order_id:
-        return
-    o = db.get(SalesOrder, d.sales_order_id)
-    if o is None or o.order_type != OrderType.local:
+    # Balance guard for ANY order-linked line (Standard AND Local orders):
+    # never dispatch more than the remaining schedule on the linked order line.
+    # Cumulative dispatched is computed across all existing dispatches.
+    if not d.sales_order_id and not any(ln.sales_order_line_id for ln in added):
         return
     remaining_totals: dict[int, float] = {}
     for ln in added:
@@ -289,7 +338,7 @@ def _require_available_stock(db: Session, d: Dispatch, added: list[DispatchLine]
         remaining = order_line_remaining(db, rid)
         if remaining is None:
             continue
-        if qty > remaining:
+        if qty > remaining + 1e-9:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(f"Cannot dispatch more than the remaining {remaining:g} on this order line "
@@ -383,12 +432,12 @@ def create_dispatch(body: DispatchCreate, db: Annotated[Session, Depends(get_db)
         dispatch_date=body.dispatch_date, delivery_status=body.delivery_status,
         transport_details=body.transport_details, report_date=body.report_date,
         remarks=body.remarks,
-        lines=_resolve_dispatch_lines(db, body.lines),
+        lines=_resolve_dispatch_lines(db, body.lines, sales_order_id=body.sales_order_id),
     )
-    d.dispatched_qty = sum(float(l.quantity or 0) for l in d.lines)
-    _recalc_status(d)
-    # Mandatory Local Order guard: never dispatch more than CURRENTLY available
-    # at the Dispatch location (checked before any stock effect is applied).
+    _recalc_header(db, d)
+    # Mandatory guard: never dispatch more than CURRENTLY available stock at the
+    # Dispatch location, nor more than the remaining schedule on any linked
+    # order line (checked before any stock effect is applied).
     _require_available_stock(db, d, list(d.lines))
     db.add(d)
     db.flush()
@@ -416,20 +465,24 @@ def add_dispatch_line(dispatch_id: int, body: DispatchLineIn,
         if dp is not None:
             d.plant_id = dp.id
     product = _resolve_line_product(db, body)
+    sched = resolve_line_schedule(db, d.sales_order_id,
+                                  product.id if product else None,
+                                  body.sales_order_line_id, body.schedule_qty)
     new_line = DispatchLine(dispatch_id=d.id, product_id=product.id if product else None,
                             description=(body.description or "").strip(),
                             quantity=body.quantity,
                             dispatch_date=body.dispatch_date or date.today(),
                             rate=body.rate, weight=body.weight,
-                            sales_order_line_id=body.sales_order_line_id)
-    # Mandatory Local Order guard: the additional quantity must be <= the stock
-    # currently available at the Dispatch location.
+                            sales_order_line_id=body.sales_order_line_id,
+                            schedule_qty=sched if sched is not None else float(body.quantity or 0))
+    # Mandatory guard: the additional quantity must be <= the stock currently
+    # available at the Dispatch location AND within the order line's remaining
+    # schedule (when the line is order-linked).
     _require_available_stock(db, d, [new_line])
     db.add(new_line)
     db.flush()
     db.expire(d, ["lines"])
-    d.dispatched_qty = sum(float(l.quantity or 0) for l in d.lines)
-    _recalc_status(d)
+    _recalc_header(db, d)
     if product:
         apply_movement(db, product.id, MovementType.dispatch, body.quantity,
                        body.dispatch_date or date.today(), ref_type="dispatch", ref_id=d.id,
@@ -479,21 +532,25 @@ def update_dispatch_line(line_id: int, body: DispatchLineIn,
         if net_delta > 0:
             ensure_available_stock(db, pid, d.plant_id, net_delta,
                                    context=f"dispatch {d.dispatch_no or 'stock out'}")
-    # Balance guard on edit (LOCAL orders only, unchanged rule): the edited
-    # entry (with its own old qty excluded) plus everything else on the order
-    # line must still be within the remaining schedule.
-    if d.sales_order_id:
-        o = db.get(SalesOrder, d.sales_order_id)
-        if o is not None and o.order_type == OrderType.local and ln.sales_order_line_id is not None:
-            remaining = order_line_remaining(db, ln.sales_order_line_id, exclude_line_id=ln.id)
-            if remaining is not None and new_qty > remaining:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=(f"Cannot dispatch more than the remaining {remaining:g} on this order line "
-                            f"(trying to dispatch {new_qty:g})."),
-                )
-    d.dispatched_qty = sum(float(l.quantity or 0) for l in d.lines)
-    _recalc_status(d)
+    # Balance guard on edit (ANY order-linked line, Standard and Local): the
+    # edited entry (with its own old qty excluded) plus everything else on the
+    # order line must still be within the line's remaining schedule.
+    if ln.sales_order_line_id is not None:
+        remaining = order_line_remaining(db, ln.sales_order_line_id, exclude_line_id=ln.id)
+        if remaining is not None and new_qty > remaining + 1e-9:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(f"Cannot dispatch more than the remaining {remaining:g} on this order line "
+                        f"(trying to dispatch {new_qty:g})."),
+            )
+    # If the link changed, re-derive the product-wise schedule for the line.
+    if body.sales_order_line_id is not None:
+        ln.schedule_qty = resolve_line_schedule(
+            db, d.sales_order_id, ln.product_id, ln.sales_order_line_id,
+            body.schedule_qty if body.schedule_qty is not None else ln.schedule_qty)
+    elif body.schedule_qty is not None:
+        ln.schedule_qty = body.schedule_qty
+    _recalc_header(db, d)
     _sync_dispatch_stock(db, d)
     db.commit()
     db.refresh(d)
@@ -533,8 +590,7 @@ def delete_dispatch_line(line_id: int, db: Annotated[Session, Depends(get_db)],
         db.commit()
         sync_purchase_shortages(db)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
-    d.dispatched_qty = sum(float(l.quantity or 0) for l in d.lines)
-    _recalc_status(d)
+    _recalc_header(db, d)
     _sync_dispatch_stock(db, d)
     db.commit()
     db.refresh(d)
@@ -635,15 +691,29 @@ def customer_items(
                 if sol.customer_po_no and sol.customer_po_no not in e["po_nos"]:
                     e["po_nos"].append(sol.customer_po_no)
                 e.setdefault("schedule_qty", 0.0)
-                e["schedule_qty"] += float(sol.quantity or 0)
+                e["schedule_qty"] += order_line_schedule(sol) or 0.0
 
-    # For products with NO linked sales order, fall back to Dispatch.schedule_qty
+    # For products with NO linked sales order, fall back to the product-wise
+    # line schedules stored on the dispatch lines (de-duplicated by order line),
+    # never the dispatch header total.
     for pid, e in by_product.items():
         if "schedule_qty" not in e or not e["schedule_qty"]:
             sched = 0.0
+            seen_lines: set[int] = set()
             for d in all_dispatches:
-                if any(ln.product_id == pid for ln in d.lines):
-                    sched += float(d.schedule_qty or 0)
+                for ln in d.lines:
+                    if ln.product_id != pid:
+                        continue
+                    if ln.sales_order_line_id:
+                        if ln.sales_order_line_id in seen_lines:
+                            continue
+                        seen_lines.add(ln.sales_order_line_id)
+                    val = ln.schedule_qty
+                    if val is None:
+                        # Legacy unmapped line: the header schedule is only
+                        # attributable when this dispatch has a single line.
+                        val = d.schedule_qty if len(d.lines) == 1 else ln.quantity
+                    sched += float(val or 0)
             e["schedule_qty"] = sched
 
     # Sort history by date desc
@@ -673,6 +743,50 @@ def customer_items(
         })
 
     return {"items": items, "total": len(items)}
+
+
+@router.get("/order-lines/{sales_order_id}", response_model=dict)
+def dispatch_order_lines(sales_order_id: int, db: Annotated[Session, Depends(get_db)],
+                         _: CurrentUser):
+    """Per-order-line schedule / dispatched / remaining for a sales order
+    (Standard or Local) — the product-wise defaults for the dispatch form.
+
+    Schedule is the line's own (schedule_qty ?? ordered quantity); dispatched
+    is the cumulative total recorded against that line across all dispatches;
+    remaining is schedule minus dispatched (never negative for new writes).
+    """
+    o = db.get(SalesOrder, sales_order_id)
+    if o is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sales order not found")
+    items = []
+    for ln in o.lines:
+        sched = order_line_schedule(ln)
+        disp = float(db.scalar(
+            select(func.coalesce(func.sum(DispatchLine.quantity), 0))
+            .where(DispatchLine.sales_order_line_id == ln.id)
+        ) or 0)
+        prog = line_progress(sched, disp)
+        items.append({
+            "sales_order_line_id": ln.id,
+            "product_id": ln.product_id,
+            "item_code": ln.item_code or (ln.product.item_code if ln.product else ""),
+            "description": ln.description or (ln.product.model if ln.product else ""),
+            "uom": ln.uom or "",
+            "order_qty": float(ln.quantity or 0),
+            "schedule_qty": sched,
+            "dispatched_qty": disp,
+            "remaining_qty": prog["balance_qty"],
+            "completion_pct": prog["completion_pct"],
+            "status": prog["status"],
+            "rate": float(ln.unit_price) if ln.unit_price is not None else None,
+        })
+    return {
+        "items": items,
+        "order_no": o.order_no,
+        "order_type": o.order_type.value if o.order_type else None,
+        "customer_id": o.customer_id,
+        "customer_name": o.customer.name if o.customer else o.customer_name,
+    }
 
 
 def _completed_line_attribution(db: Session, sales_order_id, product_id) -> int | None:
@@ -979,9 +1093,23 @@ def update_dispatch(dispatch_id: int, body: DispatchUpdate, db: Annotated[Sessio
     changes = apply_updates(d, body, exclude={"lines", "customer_name"})
     if body.lines is not None:
         db.query(DispatchLine).filter(DispatchLine.dispatch_id == d.id).delete()
-        d.lines = _resolve_dispatch_lines(db, body.lines)
-    d.dispatched_qty = sum(float(l.quantity or 0) for l in d.lines)
-    _recalc_status(d)
+        d.lines = _resolve_dispatch_lines(db, body.lines, sales_order_id=d.sales_order_id)
+        # Balance guard per order-linked line: cumulative dispatched on the
+        # order line (excluding this dispatch's own previous entries) plus the
+        # new quantity must stay within the line's remaining schedule.
+        linked_totals: dict[int, float] = {}
+        for ln in d.lines:
+            if ln.sales_order_line_id is not None and float(ln.quantity or 0) > 0:
+                linked_totals[ln.sales_order_line_id] = linked_totals.get(ln.sales_order_line_id, 0.0) + float(ln.quantity or 0)
+        for rid, qty in linked_totals.items():
+            remaining = order_line_remaining(db, rid, exclude_dispatch_id=d.id)
+            if remaining is not None and qty > remaining + 1e-9:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(f"Cannot dispatch more than the remaining {remaining:g} on this order line "
+                            f"(trying to dispatch {qty:g})."),
+                )
+    _recalc_header(db, d)
     # Net-delta availability guard (C1): reconvert reverses the whole dispatch
     # then re-applies it; only the NET additional OUT per product at the (new)
     # location must be covered. A location change restores the old location and

@@ -99,6 +99,7 @@ _COLUMN_MIGRATIONS = [
     ("audit_logs", "created_count", "INTEGER DEFAULT 0"),
     ("audit_logs", "updated_count", "INTEGER DEFAULT 0"),
     ("audit_logs", "failed_count", "INTEGER DEFAULT 0"),
+    ("dispatch_lines", "schedule_qty", "DOUBLE PRECISION"),
 ]
 
 # Internal stock locations seeded as Plants (Main Store = plant_id NULL).
@@ -320,6 +321,82 @@ def _ensure_locations() -> None:
             log.info("Seeded internal locations: %s", _LOCATION_PLANTS)
 
 
+def _backfill_dispatch_line_schedules() -> None:
+    """Derive product-wise schedule_qty for existing dispatch lines (idempotent).
+
+    Mapping rules (reliable only):
+      - line.sales_order_line_id -> that order line's schedule (schedule_qty ?? quantity)
+      - else order-linked dispatch + product match -> sum of matching order lines' schedule
+    Unmappable lines (manual, no order) keep NULL — preserved for review.
+
+    Order-linked dispatches whose lines are ALL mapped get their header
+    schedule/completion/balance/status recomputed from the line schedules.
+    Manual dispatches and partially-mapped dispatches are left untouched.
+    """
+    from .database import SessionLocal
+    from .models import Dispatch, DispatchLine, SalesOrderLine, DispatchStatus
+    from .services.dispatch_calc import order_line_schedule
+
+    stats = {"mapped": 0, "unmapped": 0, "headers_recomputed": 0, "total_null": 0}
+    with SessionLocal() as db:
+        lines = db.scalars(select(DispatchLine).where(DispatchLine.schedule_qty.is_(None))).all()
+        if not lines:
+            log.info("DispatchLine.schedule_qty backfill: no NULL rows")
+            return
+        stats["total_null"] = len(lines)
+        for ln in lines:
+            sched = None
+            if ln.sales_order_line_id:
+                sol = db.get(SalesOrderLine, ln.sales_order_line_id)
+                if sol is not None:
+                    sched = order_line_schedule(sol)
+            if sched is None:
+                d = db.get(Dispatch, ln.dispatch_id)
+                if d and d.sales_order_id and ln.product_id:
+                    sols = db.scalars(
+                        select(SalesOrderLine).where(
+                            SalesOrderLine.order_id == d.sales_order_id,
+                            SalesOrderLine.product_id == ln.product_id,
+                        ).order_by(SalesOrderLine.id)
+                    ).all()
+                    if sols:
+                        sched = sum((order_line_schedule(s) or 0.0) for s in sols)
+            if sched is None or sched <= 0:
+                # Truly unmappable/manual lines: leave NULL for manual review
+                stats["unmapped"] += 1
+                continue
+            ln.schedule_qty = float(sched)
+            stats["mapped"] += 1
+        db.flush()
+        # Recompute headers only for order-linked dispatches with every line mapped
+        d_ids = {ln.dispatch_id for ln in lines}
+        for did in d_ids:
+            d = db.get(Dispatch, did)
+            if d is None or not d.sales_order_id:
+                continue
+            if not d.lines:
+                continue
+            if not all((getattr(l, "schedule_qty", None) is not None) for l in d.lines):
+                continue
+            d.schedule_qty = float(sum(float(l.schedule_qty or 0) for l in d.lines))
+            d.dispatched_qty = float(sum(float(l.quantity or 0) for l in d.lines))
+            if d.schedule_qty:
+                d.completion_pct = round(d.dispatched_qty / d.schedule_qty, 4)
+                d.balance_qty = d.schedule_qty - d.dispatched_qty
+            else:
+                d.completion_pct = 0.0
+                d.balance_qty = 0.0
+            if d.schedule_qty > 0 and d.dispatched_qty >= d.schedule_qty - 1e-9:
+                d.status = DispatchStatus.completed
+            elif d.dispatched_qty > 0:
+                d.status = DispatchStatus.partial
+            else:
+                d.status = DispatchStatus.pending
+            stats["headers_recomputed"] += 1
+        db.commit()
+    log.warning("DispatchLine.schedule_qty backfill: %s", stats)
+
+
 log = logging.getLogger("kalika")
 
 app = FastAPI(
@@ -396,8 +473,15 @@ def on_startup():
     # Internal stock locations (Dispatch, Production) — idempotent seed.
     try:
         _ensure_locations()
+        log.info("Internal locations ensured.")
     except Exception as exc:
         log.error("location seed failed (recoverable): %s", exc)
+    # Product-wise dispatch schedules (DispatchLine.schedule_qty) — backfill
+    # existing rows idempotently; never drop/truncate/reset data.
+    try:
+        _backfill_dispatch_line_schedules()
+    except Exception as exc:
+        log.error("dispatch line schedule backfill failed (recoverable): %s", exc)
     # C3: one inventory row per (product_id, plant_id) incl. Main Store (NULL
     # plant) — duplicate PRE-CHECKED; additive + idempotent, no data touched.
     try:

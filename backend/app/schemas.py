@@ -811,6 +811,10 @@ class DispatchLineIn(BaseModel):
     rate: Optional[float] = None
     weight: Optional[float] = None
     sales_order_line_id: Optional[int] = None
+    # Product-wise planned quantity for THIS line. When omitted it is derived
+    # from the linked order line (schedule_qty ?? quantity); for lines with no
+    # order link it defaults to the dispatched quantity.
+    schedule_qty: Optional[float] = None
 
 
 class DispatchCreate(BaseModel):
