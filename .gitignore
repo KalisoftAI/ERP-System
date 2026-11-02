@@ -39,8 +39,14 @@ export_*.xlsx
 .DS_Store
 Thumbs.db
 
-# Local working docs (reference only, not committed)
+# Documentation folders (local only, not committed)
+docs/
+**/docs/
 frontend/docs/
+
+# Data folders (local only, not committed)
+data/
+**/data/
 
 # Local sample data + branch-only docs (kept local; canonical copy lives in the
 # sales app branch docs/gcs-kpi-packaging-and-mcp-local)
