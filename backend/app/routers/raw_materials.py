@@ -164,6 +164,7 @@ def update_raw_material(product_id: int, body: ProductUpdate,
     p = get_or_404(db, Product, product_id)
     if p.category != ProductCategory.raw_material:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Raw material not found")
+    old_model = p.model
     if body.model is not None:
         new_model = (body.model or "").strip()
         if not new_model:
@@ -176,7 +177,9 @@ def update_raw_material(product_id: int, body: ProductUpdate,
                                 f"Another record already uses material name '{new_model}'.")
         p.model = new_model
     # Category stays raw_material (excluded from generic update).
-    apply_updates(p, body, exclude={"model", "category"})
+    changes = apply_updates(p, body, exclude={"model", "category"})
+    if old_model != p.model:
+        changes["model"] = {"old": old_model, "new": p.model}
     try:
         db.commit()
     except Exception:
@@ -184,7 +187,8 @@ def update_raw_material(product_id: int, body: ProductUpdate,
         raise HTTPException(status.HTTP_409_CONFLICT,
                             "Could not update raw material (item code / model already in use).")
     db.refresh(p)
-    write_audit(db, user, "UPDATE", "products", p.id, f"Updated raw material {p.model}")
+    write_audit(db, user, "UPDATE", "products", p.id, f"Updated raw material {p.model}",
+                changes=changes)
     return p
 
 
@@ -470,7 +474,10 @@ async def import_raw_materials(
     write_audit(db, user, "IMPORT", "import_batches", batch.id,
                 f"Raw material import: {len(created_ids)} created, "
                 f"{len(upserted_ids) - len(created_ids)} matched, "
-                f"{len(row_errors)} row errors")
+                f"{len(row_errors)} row errors",
+                created=len(created_ids),
+                updated=len(upserted_ids) - len(created_ids),
+                failed=len(row_errors))
     return {
         "batch_id": batch.id,
         "summary": {"rows": processed, "created": len(created_ids),

@@ -81,7 +81,7 @@ export function Modal({ open, title, subtitle, onClose, children, wide = false, 
   if (!visible) return null
 
   return createPortal(
-    <div className="modal-overlay" onClick={onClose}>
+    <div className="modal-overlay">
       <div
         className={`modal-panel ${wide ? 'modal-wide' : ''} ${xwide ? 'modal-xwide' : ''}`}
         onClick={(e) => e.stopPropagation()}

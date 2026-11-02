@@ -226,7 +226,7 @@ def update_plan(plan_id: int, body: PlanUpdate, db: Annotated[Session, Depends(g
     if "sales_order_id" in data:
         data["sales_order_id"] = _resolve_sales_order(db, data.get("sales_order_id"))
     valid = {k: v for k, v in data.items() if k in PlanUpdate.model_fields}
-    apply_updates(p, PlanUpdate(**valid))
+    changes = apply_updates(p, PlanUpdate(**valid))
     now_completed = (p.status or "").strip().upper() == "COMPLETED" and p.plan_type == PlanType.production
     if was_completed and not now_completed:
         # Un-completing a production plan reverses its posted output (C2).
@@ -236,7 +236,7 @@ def update_plan(plan_id: int, body: PlanUpdate, db: Annotated[Session, Depends(g
         _post_plan_output(db, p)
     db.commit()
     db.refresh(p)
-    write_audit(db, user, "UPDATE", "plans", p.id, f"Updated plan {p.id}")
+    write_audit(db, user, "UPDATE", "plans", p.id, f"Updated plan {p.id}", changes=changes)
     return p
 
 

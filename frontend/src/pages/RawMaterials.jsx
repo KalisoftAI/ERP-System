@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
-  Plus, Pencil, Trash2, Eye, Search, Download, RefreshCw, Package,
+  Plus, Pencil, Trash2, Eye, Search, Download, RefreshCw,
   AlertTriangle, CheckCircle2, Boxes, ArrowDownToLine, ClipboardList,
 } from 'lucide-react'
 import api, { downloadFile } from '../lib/api'
@@ -41,11 +41,6 @@ export default function RawMaterials() {
   const [saving, setSaving] = useState(false)
   const [openingStock, setOpeningStock] = useState('')
   const [showInactive, setShowInactive] = useState(false)
-  const [stockModal, setStockModal] = useState(null)
-  const [stockValue, setStockValue] = useState('')
-  const [stockRemarks, setStockRemarks] = useState('')
-  const [stockBusy, setStockBusy] = useState(false)
-  const [stockErr, setStockErr] = useState(null)
   const [showImport, setShowImport] = useState(false)
   const [importFile, setImportFile] = useState(null)
   const [importResult, setImportResult] = useState(null)
@@ -138,22 +133,27 @@ export default function RawMaterials() {
           schedule_qty: row.balance?.schedule_qty ?? '',
           ask_till_date: row.balance?.ask_till_date ?? '',
           inward_qty: row.balance?.inward_qty ?? '',
-          opening_stock: row.balance?.opening_stock ?? '',
+          opening_stock: row.current_stock ?? '',
           min_stock: row.balance?.min_stock ?? '',
           max_stock: row.balance?.max_stock ?? '',
         }
-      : { product_id: '', report_date: new Date().toISOString().slice(0, 10) })
+      : { product_id: '', report_date: new Date().toISOString().slice(0, 10), opening_stock: '' })
     setModal('balance')
   }
 
   const saveBalance = async () => {
     if (!balance.product_id) { notify('Select a raw material', true); return }
     try {
-      const params = { product_id: Number(balance.product_id), report_date: balance.report_date }
+      const productId = Number(balance.product_id)
+      const params = { product_id: productId, report_date: balance.report_date }
       for (const k of ['schedule_qty', 'ask_till_date', 'inward_qty', 'opening_stock', 'min_stock', 'max_stock']) {
         if (balance[k] !== '' && balance[k] != null) params[k] = Number(balance[k])
       }
       await api.post('/raw-materials/balances', null, { params })
+      // Opening Stock is the actual/current available stock; update inventory.
+      if (balance.opening_stock !== '' && balance.opening_stock != null) {
+        await api.post(`/raw-materials/${productId}/stock`, { current_stock: Number(balance.opening_stock) })
+      }
       notify('Balance saved')
       setModal(null)
       load()
@@ -191,7 +191,7 @@ export default function RawMaterials() {
         ? <Badge className={r.balance.completion_pct >= 1 ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-600'}>{fmtNum((r.balance.completion_pct || 0) * 100)}%</Badge>
         : '—',
     },
-    { key: 'stock', label: 'Current Stock', render: (r) => <span className="font-semibold">{fmtNum(r.current_stock)}</span> },
+    { key: 'stock', label: 'Opening Stock', render: (r) => <span className="font-semibold">{fmtNum(r.current_stock)}</span> },
     { key: 'min', label: 'MIN STOCK', render: (r) => r.balance?.min_stock != null ? <span className="font-mono text-xs">{fmtNum(r.balance.min_stock)}</span> : '—' },
     { key: 'status', label: 'Status', render: (r) => { const s = stockStatus(r); return <Badge className={s.cls} dot>{s.label}</Badge> } },
     {
@@ -201,7 +201,6 @@ export default function RawMaterials() {
           <button onClick={() => openView(r)} className="btn btn-ghost p-1.5" title="View"><Eye size={15} /></button>
           <button onClick={() => openEdit(r)} className="btn btn-ghost p-1.5" title="Edit"><Pencil size={15} /></button>
           <button onClick={() => openBalance(r)} className="btn btn-ghost p-1.5" title="Update Balance"><ClipboardList size={15} /></button>
-          <button onClick={() => { setStockModal(r); setStockValue(String(r.current_stock ?? '')); setStockRemarks('') }} className="btn btn-ghost p-1.5 text-purple-600 hover:text-purple-800" title="Set current stock"><Package size={15} /></button>
           <button onClick={() => remove(r)} className="btn btn-ghost p-1.5 text-red-400" title="Delete"><Trash2 size={15} /></button>
         </div>
       ),
@@ -218,7 +217,6 @@ export default function RawMaterials() {
           <>
             <button onClick={() => downloadFile('/reports/raw-materials/csv', 'raw_materials.csv')} className="btn btn-secondary"><Download size={15} /> CSV</button>
             <button onClick={load} className="btn btn-secondary"><RefreshCw size={15} /> Refresh</button>
-            <button onClick={() => openBalance(null)} className="btn btn-secondary"><ClipboardList size={15} /> Update Balance</button>
             <button onClick={() => setShowImport(true)} className="btn btn-secondary"><ArrowDownToLine size={15} /> Import</button>
             <button onClick={openNew} className="btn btn-primary"><Plus size={15} /> Add Raw Material</button>
           </>
@@ -340,36 +338,9 @@ export default function RawMaterials() {
         </Modal>
       )}
 
-      {stockModal && (
-        <div className="modal-overlay" onClick={() => setStockModal(null)}>
-          <div className="modal-panel p-5" onClick={e => e.stopPropagation()}>
-            <h3 className="text-lg font-bold mb-1">{stockModal.model}</h3>
-            <p className="text-gray-500 text-sm mb-4">Set current stock (Main Store)</p>
-            <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Current Stock</label>
-            <input type="number" className="input text-2xl font-bold py-3 w-full mb-4" value={stockValue} onChange={e => setStockValue(e.target.value)} min="0" step="0.01" />
-            <label className="block text-xs font-medium text-gray-500 uppercase tracking-wide mb-1">Remarks (optional)</label>
-            <input type="text" className="input mb-4" value={stockRemarks} onChange={e => setStockRemarks(e.target.value)} placeholder="Reason for adjustment..." />
-            {stockErr && <div className="text-red-500 text-sm mb-2">{stockErr}</div>}
-            <div className="flex gap-2">
-              <button onClick={async () => {
-                setStockBusy(true); setStockErr(null)
-                try {
-                  const { data } = await api.post(`/raw-materials/${stockModal.id}/stock`, { current_stock: Number(stockValue), remarks: stockRemarks })
-                  notify(`Stock set: ${data.previous_stock} → ${data.current_stock} (delta ${data.delta})`)
-                  setStockModal(null); load()
-                } catch (e) { setStockErr(e.response?.data?.detail || 'Update failed') }
-                finally { setStockBusy(false) }
-              }} className="btn btn-primary" disabled={stockBusy}>
-                {stockBusy ? 'Saving…' : 'Update Stock'}
-              </button>
-              <button onClick={() => setStockModal(null)} className="btn btn-secondary">Cancel</button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {showImport && (
-        <div className="modal-overlay" onClick={() => setShowImport(null)}>
+        <div className="modal-overlay">
           <div className="modal-panel p-5 max-w-lg" onClick={e => e.stopPropagation()}>
             <h3 className="text-lg font-bold mb-4">Import Raw Materials</h3>
             <p className="text-sm text-gray-500 mb-4">

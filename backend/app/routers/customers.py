@@ -67,10 +67,11 @@ def get_customer(customer_id: int, db: Annotated[Session, Depends(get_db)],
 def update_customer(customer_id: int, body: CustomerUpdate, db: Annotated[Session, Depends(get_db)],
                     user: ManagerOrAdmin):
     cust = get_or_404(db, Customer, customer_id)
-    apply_updates(cust, body)
+    changes = apply_updates(cust, body)
     db.commit()
     db.refresh(cust)
-    write_audit(db, user, "UPDATE", "customers", cust.id, f"Updated customer {cust.name}")
+    write_audit(db, user, "UPDATE", "customers", cust.id, f"Updated customer {cust.name}",
+                changes=changes)
     return cust
 
 

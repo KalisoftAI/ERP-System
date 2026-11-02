@@ -3,13 +3,14 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import CurrentUser, ManagerOrAdmin
 from ..crud import apply_updates, get_or_404, write_audit
 from ..database import get_db
 from ..models import (
-    MovementType, Product, ProductCategory,
+    MovementType, Product, ProductCategory, PRN,
     PurchaseOrder, PurchaseOrderLine, PurchaseStatus, Supplier,
     ImportBatch,
 )
@@ -18,9 +19,11 @@ from ..services.import_common import (
     build_column_map, cell_num, is_blank_row, normalize_header, parse_date_value,
     read_table, row_to_dict,
 )
+from ..services.prn_fulfilment import affected_prn_ids, sync_prn_fulfilment
 from ..services.reorder_alerts import refresh_reorder_alert
 from ..services.rm_service import add_rm_inward, match_raw_material
 from ..services.stock_service import apply_movement, resolve_or_create_product, reverse_and_remove_ref
+from ..services.suppliers import get_or_create_supplier
 from ..schemas import (
     PurchaseOrderCreate, PurchaseOrderLineIn, PurchaseOrderUpdate,
 )
@@ -30,6 +33,12 @@ import json
 router = APIRouter(prefix="/purchases", tags=["purchases"])
 
 
+def _prn_number(db: Session, prn_id: int | None) -> str:
+    if not prn_id:
+        return ""
+    return db.scalar(select(PRN.prn_number).where(PRN.id == prn_id)) or ""
+
+
 def _serialize_po(db: Session, po: PurchaseOrder) -> dict:
     supplier = po.supplier
     lines = []
@@ -37,29 +46,63 @@ def _serialize_po(db: Session, po: PurchaseOrder) -> dict:
         lines.append({
             "id": ln.id, "product_id": ln.product_id, "description": ln.description,
             "item_code": ln.item_code or (ln.product.item_code if ln.product else ""),
+            "make": ln.make or "",
             "quantity": ln.quantity, "received_qty": ln.received_qty,
             "rate": float(ln.rate) if ln.rate is not None else None,
             "amount": float(ln.amount) if ln.amount is not None else None,
             "uom": ln.uom or (ln.product.uom if ln.product else ""),
             "tax_percent": float(ln.tax_percent) if ln.tax_percent is not None else None,
             "discount_percent": float(ln.discount_percent) if ln.discount_percent is not None else None,
+            "prn_line_id": ln.prn_line_id,
             "product": {"id": ln.product.id, "model": ln.product.model, "item_code": ln.product.item_code,
                         "category": ln.product.category.value} if ln.product else None,
         })
+    po_type = getattr(po, "po_type", "regular") or "regular"
+    if po_type.lower() == "import":
+        # Import POs keep their own supplier snapshot (manual entry is allowed),
+        # falling back to the linked master record for older records.
+        supplier_payload = None
+        if supplier or po.supplier_name or po.supplier_address or po.supplier_email:
+            supplier_payload = {
+                "id": supplier.id if supplier else None,
+                "name": po.supplier_name or (supplier.name if supplier else ""),
+                "gstin": (supplier.gstin or "") if supplier else "",
+                "address": po.supplier_address or (supplier.address if supplier else ""),
+                "phone": (supplier.phone or "") if supplier else "",
+                "email": po.supplier_email or (supplier.email if supplier else ""),
+            }
+    else:
+        supplier_payload = ({"id": supplier.id, "name": supplier.name, "gstin": supplier.gstin or "",
+                             "address": supplier.address or "", "phone": supplier.phone or "",
+                             "email": supplier.email or ""}
+                            if supplier else ({"name": po.supplier_name} if po.supplier_name else None))
     return {
         "id": po.id, "po_number": po.po_number, "supplier_id": po.supplier_id,
         "supplier_name": po.supplier_name or "",
-        "order_date": po.order_date, "status": po.status.value,
+        "order_date": po.order_date, "valid_until": po.valid_until, "status": po.status.value,
         "total_amount": float(po.total_amount), "notes": po.notes,
         "created_at": po.created_at,
-        "supplier": {"id": supplier.id, "name": supplier.name}
-        if supplier else ({"name": po.supplier_name} if po.supplier_name else None),
+        "prn_id": po.prn_id,
+        "prn_number": _prn_number(db, po.prn_id),
+        "po_type": po_type,
+        "supplier": supplier_payload,
         "lines": lines,
     }
 
 
+def _line_total(ln: PurchaseOrderLine) -> float:
+    """Compute final line total: qty*rate -> discount -> taxable -> GST -> total."""
+    qty = float(ln.quantity or 0)
+    rate = float(ln.rate or 0)
+    basic = qty * rate
+    discount = round(basic * (ln.discount_percent or 0) / 100, 2)
+    taxable = basic - discount
+    gst = round(taxable * (ln.tax_percent or 0) / 100, 2)
+    return round(taxable + gst, 2)
+
+
 def _recalc(po: PurchaseOrder, lines: list[PurchaseOrderLine]):
-    total = sum(float(l.amount or 0) for l in lines)
+    total = sum(float(_line_total(l)) for l in lines)
     po.total_amount = total
     received = all(float(l.received_qty or 0) >= float(l.quantity or 0) and float(l.quantity or 0) > 0 for l in lines if l.quantity)
     partial = any(float(l.received_qty or 0) > 0 for l in lines)
@@ -119,6 +162,27 @@ def _resolve_line_product(db: Session, line: PurchaseOrderLine) -> Product | Non
     return p
 
 
+def _purchase_stats(db: Session, conditions: list) -> dict:
+    """Aggregate counts/values over the full filtered set (not just one page).
+
+    Lets the Purchases screen show accurate totals while the table itself is
+    loaded page-by-page (infinite scroll)."""
+    def _count(extra):
+        return db.scalar(
+            select(func.count()).select_from(PurchaseOrder).where(*conditions, *extra)
+        ) or 0
+
+    received = _count([PurchaseOrder.status == PurchaseStatus.received])
+    partial = _count([PurchaseOrder.status == PurchaseStatus.partially_received])
+    open_value = db.scalar(
+        select(func.coalesce(func.sum(PurchaseOrder.total_amount), 0)).where(
+            *conditions,
+            PurchaseOrder.status.in_([PurchaseStatus.ordered, PurchaseStatus.partially_received]),
+        )
+    ) or 0
+    return {"received": received, "partially_received": partial, "open_value": float(open_value)}
+
+
 @router.get("", response_model=dict)
 def list_purchases(
     db: Annotated[Session, Depends(get_db)],
@@ -131,41 +195,120 @@ def list_purchases(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=500),
 ):
-    stmt = select(PurchaseOrder)
+    conditions = []
     if search:
         like = f"%{search}%"
-        stmt = stmt.where(or_(PurchaseOrder.po_number.ilike(like), PurchaseOrder.notes.ilike(like)))
+        # Match PO number, notes and supplier name — including POs whose
+        # denormalised supplier_name is blank but whose master record matches.
+        supplier_match = select(Supplier.id).where(
+            or_(Supplier.name.ilike(like), Supplier.company.ilike(like))
+        )
+        conditions.append(or_(
+            PurchaseOrder.po_number.ilike(like),
+            PurchaseOrder.notes.ilike(like),
+            PurchaseOrder.supplier_name.ilike(like),
+            PurchaseOrder.supplier_id.in_(supplier_match),
+        ))
     if supplier_id:
-        stmt = stmt.where(PurchaseOrder.supplier_id == supplier_id)
+        conditions.append(PurchaseOrder.supplier_id == supplier_id)
     if status_:
-        stmt = stmt.where(PurchaseOrder.status == status_)
+        conditions.append(PurchaseOrder.status == status_)
     if date_from:
-        stmt = stmt.where(PurchaseOrder.order_date >= date.fromisoformat(date_from))
+        conditions.append(PurchaseOrder.order_date >= date.fromisoformat(date_from))
     if date_to:
-        stmt = stmt.where(PurchaseOrder.order_date <= date.fromisoformat(date_to))
-    total = db.scalar(select(func.count()).select_from(stmt.subquery()))
-    rows = db.scalars(stmt.order_by(PurchaseOrder.order_date.desc(), PurchaseOrder.id.desc())
-                      .offset((page - 1) * page_size).limit(page_size)).all()
+        conditions.append(PurchaseOrder.order_date <= date.fromisoformat(date_to))
+
+    total = db.scalar(select(func.count()).select_from(PurchaseOrder).where(*conditions))
+    # Newest first by creation time, then PO date, then id — deterministic so
+    # paged/infinite-scroll loads never drop or duplicate records.
+    rows = db.scalars(
+        select(PurchaseOrder).where(*conditions)
+        .order_by(PurchaseOrder.created_at.desc(), PurchaseOrder.order_date.desc(), PurchaseOrder.id.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    ).all()
     return {"items": [_serialize_po(db, p) for p in rows],
-            "total": total, "page": page, "page_size": page_size}
+            "total": total, "page": page, "page_size": page_size,
+            "stats": _purchase_stats(db, conditions)}
 
 
 @router.post("", response_model=dict, status_code=status.HTTP_201_CREATED)
 def create_purchase(body: PurchaseOrderCreate, db: Annotated[Session, Depends(get_db)],
-                    user: ManagerOrAdmin):
-    if body.supplier_id is not None and not db.get(Supplier, body.supplier_id):
-        raise HTTPException(status_code=400, detail=f"Supplier {body.supplier_id} not found")
-    po = PurchaseOrder(po_number=body.po_number, supplier_id=body.supplier_id,
-                       supplier_name=(body.supplier_name or "").strip(),
-                       order_date=body.order_date, notes=body.notes)
+                    user: ManagerOrAdmin, response: Response):
+    # Idempotent create: a replayed request (double-click / retry after a lost
+    # response) with the same key returns the PO the first attempt created.
+    key = (body.idempotency_key or "").strip()
+    if key:
+        existing = db.scalars(
+            select(PurchaseOrder).where(PurchaseOrder.idempotency_key == key)).first()
+        if existing is not None:
+            response.status_code = status.HTTP_200_OK
+            return _serialize_po(db, existing)
+
+    po_type = (getattr(body, "po_type", "regular") or "regular").lower()
+    is_import = po_type == "import"
+
+    supplier = None
+    if body.supplier_id is not None:
+        supplier = db.get(Supplier, body.supplier_id)
+        if not supplier:
+            raise HTTPException(status_code=400, detail=f"Supplier {body.supplier_id} not found")
+    # Regular POs keep promoting free-text suppliers into the master. Import POs
+    # never create or modify a Supplier record from manually entered details.
+    if (not is_import and supplier is None
+            and (body.supplier_name or body.supplier_gstin or body.supplier_phone or body.supplier_email)):
+        supplier = get_or_create_supplier(
+            db,
+            name=body.supplier_name,
+            gstin=body.supplier_gstin,
+            address=body.supplier_address,
+            phone=body.supplier_phone,
+            email=body.supplier_email,
+        )
+    po = PurchaseOrder(
+        po_number=body.po_number,
+        supplier_id=supplier.id if supplier else None,
+        supplier_name=((body.supplier_name or "").strip()
+                       or (supplier.name if supplier else "")),
+        supplier_address=((body.supplier_address or "").strip()
+                          or (supplier.address if supplier else "")) if is_import else "",
+        supplier_email=((body.supplier_email or "").strip()
+                        or (supplier.email if supplier else "")) if is_import else "",
+        order_date=body.order_date, valid_until=body.valid_until, notes=body.notes,
+        prn_id=body.prn_id, idempotency_key=key or None,
+        po_type=po_type,
+    )
     lines = [PurchaseOrderLine(**ln.model_dump()) for ln in body.lines]
+    for ln in lines:
+        ln.amount = _line_total(ln)
     po.lines = lines
     _recalc(po, lines)
     db.add(po)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Concurrent duplicate of the same idempotency key — return that PO.
+        db.rollback()
+        existing = db.scalars(
+            select(PurchaseOrder).where(PurchaseOrder.idempotency_key == key)).first() if key else None
+        if existing is not None:
+            response.status_code = status.HTTP_200_OK
+            return _serialize_po(db, existing)
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            "Could not create purchase order; please retry")
     db.refresh(po)
-    write_audit(db, user, "CREATE", "purchase_orders", po.id, f"Created PO {po.po_number}")
+    prn_no = _prn_number(db, po.prn_id)
+    write_audit(db, user, "CREATE", "purchase_orders", po.id,
+                f"Created PO {po.po_number}" + (f" from PRN {prn_no}" if prn_no else ""))
+    # Ordering a PRN does not yet fulfil it (no receipt), but the linked PO is
+    # now visible to the PRN's purchasing progress; sync keeps status authoritative.
+    transitions = sync_prn_fulfilment(db, {po.prn_id})
+    if transitions:
+        db.commit()
+        for t in transitions:
+            write_audit(db, user, "PO_LINKED", "prns", t["prn_id"],
+                        f"PO {po.po_number} created ({t['from']} -> {t['to']})")
     return _serialize_po(db, po)
+
 
 
 @router.get("/{po_id}", response_model=dict)
@@ -179,18 +322,68 @@ def get_purchase(po_id: int, db: Annotated[Session, Depends(get_db)],
 def update_purchase(po_id: int, body: PurchaseOrderUpdate, db: Annotated[Session, Depends(get_db)],
                     user: ManagerOrAdmin):
     po = get_or_404(db, PurchaseOrder, po_id)
+    before = {k: getattr(po, k) for k in (
+        "po_number", "po_type", "supplier_id", "supplier_name", "supplier_address", "supplier_email")}
     if body.po_number is not None and body.po_number != po.po_number:
         po.po_number = body.po_number
-    if body.supplier_id is not None and not db.get(Supplier, body.supplier_id):
-        raise HTTPException(status_code=400, detail=f"Supplier {body.supplier_id} not found")
-    apply_updates(po, body, exclude={"lines", "po_number"})
+
+    target_type = (body.po_type if body.po_type is not None else (po.po_type or "regular")).lower()
+    is_import = target_type == "import"
+
+    # Resolve supplier first so free-text supplier details can create/link a master record.
+    supplier = None
+    if body.supplier_id is not None:
+        supplier = db.get(Supplier, body.supplier_id)
+        if not supplier:
+            raise HTTPException(status_code=400, detail=f"Supplier {body.supplier_id} not found")
+    if not is_import:
+        if supplier is None and (body.supplier_name or body.supplier_gstin or body.supplier_phone or body.supplier_email):
+            supplier = get_or_create_supplier(
+                db,
+                name=body.supplier_name,
+                gstin=body.supplier_gstin,
+                address=body.supplier_address,
+                phone=body.supplier_phone,
+                email=body.supplier_email,
+            )
+        if supplier is not None:
+            po.supplier_id = supplier.id
+            po.supplier_name = supplier.name
+    else:
+        # Import POs keep edited/manual supplier details on the PO only.
+        if supplier is not None:
+            po.supplier_id = supplier.id
+            po.supplier_name = (body.supplier_name or "").strip() or supplier.name
+            po.supplier_address = (body.supplier_address or "").strip() or supplier.address or ""
+            po.supplier_email = (body.supplier_email or "").strip() or supplier.email or ""
+        else:
+            if "supplier_id" in body.model_fields_set:
+                po.supplier_id = None
+            if body.supplier_name is not None:
+                po.supplier_name = body.supplier_name.strip()
+            if body.supplier_address is not None:
+                po.supplier_address = body.supplier_address.strip()
+            if body.supplier_email is not None:
+                po.supplier_email = body.supplier_email.strip()
+
+    changes = apply_updates(po, body, exclude={"lines", "po_number", "supplier_id", "supplier_name",
+                                               "supplier_gstin", "supplier_address", "supplier_phone", "supplier_email"})
+    if body.po_type is not None:
+        po.po_type = target_type
+    for field, old in before.items():
+        new = getattr(po, field)
+        if old != new:
+            changes[field] = {"old": old, "new": new}
+    affected = {po.prn_id} if po.prn_id else set()
     if body.lines is not None:
+        affected |= affected_prn_ids(db, list(po.lines))
         # Reverse every previously received quantity before replacing the
         # line set, so editing a received PO never leaves stale stock.
         reverse_and_remove_ref(db, "purchase_order", po.id)
         db.query(PurchaseOrderLine).filter(PurchaseOrderLine.po_id == po.id).delete()
         lines = [PurchaseOrderLine(**ln.model_dump()) for ln in body.lines]
         for ln in lines:
+            ln.amount = _line_total(ln)
             if ln.received_qty and ln.received_qty > float(ln.quantity or 0):
                 raise HTTPException(status_code=400,
                                     detail="Received quantity cannot exceed ordered quantity")
@@ -204,9 +397,17 @@ def update_purchase(po_id: int, body: PurchaseOrderUpdate, db: Annotated[Session
                                    remarks=f"Receipt against PO {po.po_number}")
                     refresh_reorder_alert(db, product.id)
         _recalc(po, lines)
+        affected |= affected_prn_ids(db, lines)
     db.commit()
     db.refresh(po)
-    write_audit(db, user, "UPDATE", "purchase_orders", po.id, f"Updated PO {po.po_number}")
+    write_audit(db, user, "UPDATE", "purchase_orders", po.id, f"Updated PO {po.po_number}",
+                changes=changes)
+    transitions = sync_prn_fulfilment(db, affected)
+    if transitions:
+        db.commit()
+        for t in transitions:
+            write_audit(db, user, "RECEIPT", "prns", t["prn_id"],
+                        f"PO {po.po_number} updated ({t['from']} -> {t['to']})")
     result = _serialize_po(db, po)
     _attach_stock_warnings(result, po.lines)
     return result
@@ -248,9 +449,17 @@ def receive_purchase(po_id: int, line_id: int, received_qty: float,
             if product.category == ProductCategory.raw_material:
                 add_rm_inward(db, product.id, delta)
     _recalc(po, po.lines)
+    affected = affected_prn_ids(db, [line]) | ({po.prn_id} if po.prn_id else set())
     db.commit()
     db.refresh(po)
     write_audit(db, user, "RECEIVE", "purchase_orders", po.id, f"Received {received_qty} for line {line_id}")
+    # Push the new receipt onto any PRN this line fulfils.
+    transitions = sync_prn_fulfilment(db, affected)
+    if transitions:
+        db.commit()
+        for t in transitions:
+            write_audit(db, user, "RECEIPT", "prns", t["prn_id"],
+                        f"Material received against PO {po.po_number} ({t['from']} -> {t['to']})")
     sync_purchase_shortages(db)
     result = _serialize_po(db, po)
     _attach_stock_warnings(result, po.lines)
@@ -261,10 +470,19 @@ def receive_purchase(po_id: int, line_id: int, received_qty: float,
 def delete_purchase(po_id: int, db: Annotated[Session, Depends(get_db)],
                     user: ManagerOrAdmin):
     po = get_or_404(db, PurchaseOrder, po_id)
+    affected = affected_prn_ids(db, list(po.lines)) | ({po.prn_id} if po.prn_id else set())
+    po_number = po.po_number
     reverse_and_remove_ref(db, "purchase_order", po.id)
     db.delete(po)
     db.commit()
-    write_audit(db, user, "DELETE", "purchase_orders", po_id, f"Deleted PO {po.po_number}")
+    write_audit(db, user, "DELETE", "purchase_orders", po_id, f"Deleted PO {po_number}")
+    # Reverse the fulfilment effect of the removed PO on any linked PRN.
+    transitions = sync_prn_fulfilment(db, affected)
+    if transitions:
+        db.commit()
+        for t in transitions:
+            write_audit(db, user, "RECEIPT", "prns", t["prn_id"],
+                        f"PO {po_number} deleted ({t['from']} -> {t['to']})")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -392,9 +610,15 @@ async def import_purchases(
                 product = resolve_or_create_product(db, p["item_code"], p["model"], allow_blank=True)
             rate = p["rate"]
             qty = float(p["qty"])
+            tax_pct = p["tax_percent"] or 0
+            disc_pct = p["discount_percent"] or 0
+            basic = (rate or 0) * qty
+            discount = round(basic * disc_pct / 100, 2)
+            taxable = basic - discount
+            gst = round(taxable * tax_pct / 100, 2)
             amount = p["amount"]
-            if amount is None and rate is not None:
-                amount = round(rate * qty, 2)
+            if amount is None:
+                amount = round(taxable + gst, 2)
             lines.append(PurchaseOrderLine(
                 product_id=product.id,
                 description=p["model"],
@@ -430,7 +654,13 @@ async def import_purchases(
 
     for c in created:
         write_audit(db, user, "IMPORT", "purchase_orders", c["po_id"],
-                    f"Bulk-imported PO {c['po_number']} ({c['lines']} lines)")
+                    f"Bulk-imported PO {c['po_number']} ({c['lines']} lines)",
+                    created=1)
+    failed = len(skipped) + len(errors_rows)
+    if failed:
+        write_audit(db, user, "IMPORT", "purchase_orders", None,
+                    f"PO import: {len(created)} created, {failed} failed/skipped",
+                    failed=failed)
     batch.stats = json.dumps({
         "rows": len(parsed), "created": len(created), "skipped": len(skipped),
         "errors": len(errors_rows), "lines": line_count, "source": file.filename or "",

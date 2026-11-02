@@ -101,6 +101,20 @@ if [[ -z "$JWT_SECRET" ]]; then
 fi
 
 echo ""
+echo "=== 4c/6  Locating Mail password from Secret Manager (optional) ==="
+MAIL_SECRET="${MAIL_SECRET:-kalika-mail-password}"
+MAIL_ENABLED="False"
+MAIL_SECRET_ARG=""
+if gcloud secrets describe "$MAIL_SECRET" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  MAIL_ENABLED="True"
+  MAIL_SECRET_ARG=",MAIL_PASSWORD=$MAIL_SECRET:latest"
+  echo "✓ Mail secret found; email will be enabled."
+else
+  echo "  Mail secret not found; email disabled. Create it to enable:"
+  echo "    echo -n '<your-app-password>' | gcloud secrets create ${MAIL_SECRET} --replication-policy=automatic --data-file=- --project=${PROJECT_ID}"
+fi
+
+echo ""
 echo "=== 5/6  Deploying Cloud Run service + connecting to Cloud SQL ==="
 gcloud run deploy "$SERVICE" \
   --image="${IMAGE}" \
@@ -123,8 +137,11 @@ JWT_SECRET=${JWT_SECRET},\
 DB_SECRET=${DB_SECRET},\
 REPORT_DIR=/app/reports,\
 GCS_BUCKET=kalisoftai-datahub,\
-GCS_EXCEL_FILE=Kalika_inventory/Daily Report Aug-26.xlsx" \
-  --set-secrets="CLOUD_SQL_DB_PASS=$DB_SECRET:latest"
+GCS_EXCEL_FILE=Kalika_inventory/Daily Report Aug-26.xlsx,\
+MAIL_ENABLED=${MAIL_ENABLED},\
+MAIL_USERNAME=${MAIL_USERNAME:-kalikaenterprises@gmail.com},\
+MAIL_FROM=${MAIL_FROM:-kalikaenterprises@gmail.com}" \
+  --set-secrets="CLOUD_SQL_DB_PASS=$DB_SECRET:latest${MAIL_SECRET_ARG}"
 
 # Give Cloud Run's default compute service account SQL Client + storage read roles
 RUNNER_SA="$(gcloud run services describe "$SERVICE" --region="${REGION}" --project="${PROJECT_ID}" --format='value(spec.template.spec.serviceAccountName)')"

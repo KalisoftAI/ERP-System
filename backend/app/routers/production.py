@@ -1,28 +1,36 @@
 """Production management (CRUD + daily movements + status lifecycle)."""
-from typing import Annotated
+import csv
+import io
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, UploadFile, File
-from sqlalchemy import func, or_, select
+from fastapi.responses import StreamingResponse
+from sqlalchemy import Integer, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..auth import CurrentUser, AllStaff, ManagerOrAdmin
 from ..crud import apply_updates, get_or_404, write_audit
 from ..database import get_db
 from ..models import (
-    Customer, MovementType, Plant, Product, ProductionMovement, ProductionOrder,
-    ProductionStatus, StockMovement, Plan, PlanType,
+    Customer, MovementType, Plant, Product, ProductCategory,
+    ProductionMovement, ProductionOrder, ProductionStatus, SalesOrder, StockMovement,
+    Plan, PlanType, ProductSourceType,
 )
 from ..schemas import ProductionOrderCreate, ProductionOrderOut, ProductionOrderUpdate
 from ..services.business import sync_purchase_shortages
 from ..services.customers import get_or_create_customer
 from ..services.reorder_alerts import refresh_reorder_alert
+from ..services.local_orders import sync_local_order_production_completion
 from ..services.stock_service import (
-    apply_movement, reconvert_document, resolve_or_create_product, reverse_and_remove_ref,
+    apply_movement, reconvert_document, reverse_and_remove_ref,
+    _unique_blank_model,
 )
 from ..services.import_common import (
-    build_column_map, cell_num, is_blank_row, read_table, row_to_dict,
+    build_column_map, cell_num, cell_text, is_blank_row, parse_date_value,
+    read_table, row_to_dict,
 )
-from datetime import date
+import re
+from datetime import date, datetime, timedelta
 
 router = APIRouter(prefix="/production", tags=["production"])
 
@@ -30,23 +38,38 @@ router = APIRouter(prefix="/production", tags=["production"])
 def _next_no(db: Session) -> str:
     today = date.today()
     prefix = f"PO-{today.strftime('%Y%m%d')}-"
-    n = db.scalar(select(func.count()).select_from(ProductionOrder).where(ProductionOrder.order_no.like(f"{prefix}%")))
+    n = db.scalar(
+        select(func.coalesce(func.max(func.cast(func.substr(ProductionOrder.order_no, len(prefix) + 1), Integer)), 0))
+        .where(ProductionOrder.order_no.like(f"{prefix}%"))
+    )
     return f"{prefix}{n + 1:03d}"
 
 
 def _serialize_po(db: Session, o: ProductionOrder) -> dict:
     product = o.product
     customer = o.customer
+    sales_order = o.sales_order
+    line = o.sales_order_line
     return {
         "id": o.id, "order_no": o.order_no, "product_id": o.product_id,
         "customer_id": o.customer_id,
+        "sales_order_id": o.sales_order_id,
+        "sales_order_no": sales_order.order_no if sales_order else None,
+        "sales_order_line_id": o.sales_order_line_id,
+        "sales_order_line": {
+            "id": line.id,
+            "description": line.description,
+            "item_code": line.item_code,
+            "quantity": line.quantity,
+        } if line else None,
         "section": o.section, "schedule_qty": o.schedule_qty, "ask_till_date": o.ask_till_date,
         "produced_qty": o.produced_qty, "completion_pct": o.completion_pct,
         "balance_qty": o.balance_qty, "opening_stock": o.opening_stock,
         "status": o.status.value, "start_date": o.start_date, "completion_date": o.completion_date,
         "report_date": o.report_date, "remarks": o.remarks,
         "product": {"id": product.id, "model": product.model, "item_code": product.item_code,
-                    "name": product.name, "category": product.category.value} if product else None,
+                    "name": product.name, "category": product.category.value,
+                    "source_type": product.source_type.value if product.source_type else None} if product else None,
         "customer": {"id": customer.id, "name": customer.name} if customer else None,
         "movements": [{"id": m.id, "production_order_id": m.production_order_id,
                        "quantity": m.quantity, "production_date": m.production_date} for m in o.movements],
@@ -65,6 +88,15 @@ def _recalc_status(o: ProductionOrder):
     if o.schedule_qty > 0 and o.produced_qty >= o.schedule_qty:
         o.status = ProductionStatus.completed
         o.completion_date = date.today()
+
+
+def _sync_completed_to_local_order(db: Session, o: ProductionOrder):
+    """When a ProductionOrder linked to a Manufacturing Local Order changes,
+    re-evaluate whether all per-line production plans are completed and update
+    the Local Order status accordingly."""
+    if not o.sales_order_id:
+        return
+    sync_local_order_production_completion(db, o.sales_order_id)
 
 
 def _stocked(db: Session, order_id: int) -> bool:
@@ -122,8 +154,9 @@ def create_production(body: ProductionOrderCreate, db: Annotated[Session, Depend
         get_or_404(db, Product, body.product_id)
         product_id = body.product_id
     else:
-        prod = resolve_or_create_product(
-            db, body.item_code, (body.model or body.item_code or "").strip(), allow_blank=True,
+        prod = _resolve_production_product(
+            db, body.item_code, (body.model or body.item_code or "").strip(),
+            category=body.category or "Manufacturing",
         )
         if prod is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
@@ -137,6 +170,8 @@ def create_production(body: ProductionOrderCreate, db: Annotated[Session, Depend
     o = ProductionOrder(
         order_no=body.order_no or _next_no(db), product_id=product_id,
         customer_id=customer_id,
+        sales_order_id=body.sales_order_id,
+        sales_order_line_id=body.sales_order_line_id,
         section=body.section, schedule_qty=body.schedule_qty, ask_till_date=body.ask_till_date,
         produced_qty=body.produced_qty, opening_stock=body.opening_stock,
         status=body.status, start_date=body.start_date, completion_date=body.completion_date,
@@ -240,326 +275,73 @@ def plan_vs_actual(
     return {"items": rows, "unlinked_plans": unlinked, "total": len(rows)}
 
 
-# ---------------------------------------------------------------------------
-# Flexible production plan import (CSV / Excel) — two-phase: preview -> import
-# NOTE: registered BEFORE "/{order_id}" so the literal paths are not shadowed
-# by the int path parameter.
-# ---------------------------------------------------------------------------
-
-PRODUCTION_IMPORT_ALIASES: dict[str, list[str]] = {
-    "item_code": [
-        "item code", "item_code", "itemcode", "item", "code",
-        "item no", "item number", "part code", "part no",
-    ],
-    "model": [
-        "model", "product model", "model name", "model no", "product", "description",
-    ],
-    "schedule": [
-        "schedule", "schedule qty", "schedule quantity", "scheduled qty",
-        "schedule_qty", "plan qty", "planned qty", "plan",
-    ],
-    "produced_qty": [
-        "production qty", "production quantity", "produced qty", "produced quantity",
-        "produced_qty", "actual qty", "actual production", "production", "prod qty",
-    ],
-    "completion_pct": [
-        "% comp", "comp %", "completion %", "completion pct", "% completion",
-        "completion percent", "completion", "percent complete", "completion_pct",
-    ],
-    "balance_qty": [
-        "balance qty", "balance quantity", "balance", "balance_qty",
-        "remaining qty", "pending qty",
-    ],
-    "status": ["status", "production status", "plan status"],
-    "remarks": ["remarks", "remark", "notes", "note", "comment", "comments"],
-}
-
-
-def _t(value) -> str:
-    return "" if value is None else str(value).strip()
-
-
-def _parse_pct(value) -> float | None:
-    """Parse a percentage that may be 0-1 (fraction) or 0-100 (percent)."""
-    if value is None or value == "":
-        return None
-    try:
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    if v < 0:
-        return 0.0
-    if v > 1:
-        return round(v / 100, 4)
-    return round(v, 4)
-
-
-def _lookup_import_product(db: Session, item_code: str, model: str) -> Product | None:
-    """Lookup-only product resolution for preview (never creates)."""
-    ic = (item_code or "").strip()
-    md = (model or "").strip()
-    if ic:
-        p = db.scalars(select(Product).where(Product.item_code == ic).limit(1)).first()
-        if p:
-            return p
-    if md:
-        p = db.scalars(select(Product).where(Product.model == md).limit(1)).first()
-        if p:
-            return p
-    return None
-
-
-def _resolve_import_product(db: Session, item_code: str, model: str) -> Product | None:
-    """Resolve a product for import via the existing product resolver —
-    an existing item code/model is reused; a new one is created lazily."""
-    ic = (item_code or "").strip()
-    md = (model or "").strip()
-    if not ic and not md:
-        return None
-    if ic:
-        return resolve_or_create_product(db, ic, md)
-    return resolve_or_create_product(db, "", md, allow_blank=True)
-
-
-def _detect_duplicate_production(db: Session, product_id, item_code: str,
-                                 model: str, schedule_qty) -> ProductionOrder | None:
-    """Conservative re-upload guard: same product + same schedule qty with an
-    existing production order dated in the current month. This is NOT a global
-    uniqueness rule — the caller only warns and asks for user confirmation."""
-    if product_id:
-        stmt = select(ProductionOrder).where(ProductionOrder.product_id == product_id)
-    else:
-        ic = (item_code or "").strip()
-        md = (model or "").strip()
-        if not ic and not md:
-            return None
-        stmt = (select(ProductionOrder)
-                .join(Product, Product.id == ProductionOrder.product_id))
-        if ic:
-            stmt = stmt.where(func.lower(Product.item_code) == ic.lower())
-        if md:
-            stmt = stmt.where(func.lower(Product.model) == md.lower())
-    if schedule_qty:
-        stmt = stmt.where(ProductionOrder.schedule_qty == schedule_qty)
-    today = date.today()
-    stmt = stmt.where(ProductionOrder.report_date >= date(today.year, today.month, 1))
-    return db.scalars(stmt.order_by(ProductionOrder.id.desc())).first()
-
-
-def _parse_production_import_rows(db: Session, headers: list[str], rows: list[list],
-                                  filename: str, resolve: bool = False) -> dict:
-    """Shared parser for preview and import. Preview uses lookup-only product
-    resolution (nothing is created); import uses the real product resolver.
-    % Comp / Balance Qty columns are accepted but the authoritative values are
-    always derived by _recalc_status at create time."""
-    colmap = build_column_map(headers, PRODUCTION_IMPORT_ALIASES)
-    mapped_headers = {canon: headers[idx] for idx, canon in colmap.items()}
-    valid_statuses = {s.value.lower(): s for s in ProductionStatus}
-
-    parsed: list[dict] = []
-    errors: list[dict] = []
-    warnings: list[dict] = []
-
-    for r_i, raw in enumerate(rows):
-        mapped = row_to_dict(colmap, raw)
-        if is_blank_row(mapped):
-            continue
-        row_no = r_i + 2  # 1-based header + data offset
-        row_errs: list[str] = []
-        row_warns: list[str] = []
-
-        item_code = _t(mapped.get("item_code"))
-        model = _t(mapped.get("model"))
-        schedule = cell_num(mapped.get("schedule"))
-        produced = cell_num(mapped.get("produced_qty"))
-        status_raw = _t(mapped.get("status"))
-        remarks = _t(mapped.get("remarks"))
-        # Parsed for compatibility; derived values win at create time.
-        _parse_pct(mapped.get("completion_pct"))
-        cell_num(mapped.get("balance_qty"))
-
-        if not item_code and not model:
-            row_errs.append("Item Code or Model is required")
-        if schedule is None or schedule <= 0:
-            row_errs.append("Schedule must be a positive number")
-        if produced is not None and produced < 0:
-            row_errs.append("Production Qty cannot be negative")
-
-        status_enum = None
-        if status_raw:
-            status_enum = valid_statuses.get(status_raw.lower())
-            if status_enum is None:
-                row_errs.append(
-                    f"Invalid status '{status_raw}'. Must be one of: "
-                    + ", ".join(s.value for s in ProductionStatus)
-                )
-
-        product = None
-        if item_code or model:
-            if resolve:
-                product = _resolve_import_product(db, item_code, model)
-            else:
-                product = _lookup_import_product(db, item_code, model)
-                if product is None:
-                    row_warns.append("Product not found; a new product will be created")
-
-        row_out = {
-            "row": row_no,
-            "item_code": item_code,
-            "model": model,
-            "product_id": product.id if product else None,
-            "schedule_qty": schedule,
-            "produced_qty": produced or 0.0,
-            "status": status_enum.value if status_enum else None,
-            "remarks": remarks,
-            "errors": row_errs,
-            "warnings": row_warns,
-        }
-        if row_errs:
-            errors.append(row_out)
-        else:
-            parsed.append(row_out)
-            if row_warns:
-                warnings.append(row_out)
-
-    duplicate_rows = 0
-    for row in parsed:
-        dup = _detect_duplicate_production(db, row["product_id"], row["item_code"],
-                                           row["model"], row["schedule_qty"])
-        if dup:
-            row["duplicate_of"] = {"production_id": dup.id, "order_no": dup.order_no}
-            duplicate_rows += 1
-
-    return {
-        "file_name": filename,
-        "total_rows": len(parsed) + len(errors),
-        "valid_rows": len(parsed),
-        "error_rows": len(errors),
-        "warning_rows": len(warnings),
-        "duplicate_rows": duplicate_rows,
-        "mapped_columns": mapped_headers,
-        "sample_rows": parsed[:10] + errors[:5],
-        "errors": errors,
-        "warnings": warnings,
-        "parsed": parsed,
-        "can_import": len(parsed) > 0,
-    }
-
-
-def _create_production_from_rows(db: Session, rows: list[dict], user) -> list[dict]:
-    """Persist parsed rows as ProductionOrders. Schedule / Production Qty are
-    stored as order data (same semantics as the Excel migration); completion %,
-    balance and status auto-advance come from the authoritative _recalc_status.
-    An import NEVER creates stock movements — physical finished-goods stock
-    only enters Inventory through recorded daily production output."""
-    created: list[dict] = []
-    for row in rows:
-        o = ProductionOrder(
-            order_no=_next_no(db),
-            product_id=row["product_id"],
-            schedule_qty=row["schedule_qty"],
-            produced_qty=row["produced_qty"] or 0,
-            status=ProductionStatus(row["status"]) if row["status"] else ProductionStatus.planned,
-            report_date=date.today(),
-            remarks=row["remarks"],
-        )
-        _recalc_status(o)
-        db.add(o)
-        db.flush()
-        created.append({
-            "production_id": o.id, "order_no": o.order_no,
-            "item_code": row["item_code"], "model": row["model"],
-            "schedule_qty": o.schedule_qty, "produced_qty": o.produced_qty,
-            "status": o.status.value,
-        })
-        write_audit(db, user, "IMPORT", "production_orders", o.id,
-                    f"Bulk-imported production plan {o.order_no} (schedule {o.schedule_qty:g})")
-    return created
-
-
-@router.get("/import/template")
-def production_import_template(_: CurrentUser):
-    """CSV template with exactly the supported production import columns.
-    Ask Till Date is intentionally NOT part of production import."""
-    csv_text = (
-        "Item Code,Model,Schedule,Production Qty,% Comp,Balance Qty,Status\n"
-        "SAMPLE-001,Sample Model,100,0,0,100,Planned\n"
-    )
-    return Response(
-        content=csv_text,
-        media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="production_import_template.csv"'},
-    )
-
-
-@router.post("/import-preview", response_model=dict)
-async def preview_production_import(
+@router.get("/report/orders/csv")
+def production_orders_csv(
     db: Annotated[Session, Depends(get_db)],
     _: CurrentUser,
-    file: UploadFile = File(...),
+    scope: str = Query("active", description="'active', 'completed' or 'all'"),
+    product_id: int | None = None,
 ):
-    """Parse a CSV/Excel production plan upload and return a preview with
-    validation, column mapping and duplicate warnings. Nothing is persisted."""
-    content = await file.read()
-    try:
-        headers, rows = read_table(file.filename or "upload.xlsx", content)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    if not rows:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No data rows found in file")
+    """Production orders as a CSV report (one row per production plan),
+    mirroring the Production table columns.
 
-    preview = _parse_production_import_rows(db, headers, rows, file.filename or "upload")
-    db.rollback()  # preview never persists incidental state
-    return {k: v for k, v in preview.items() if k != "parsed"}
+    scope=active    -> current (not-yet-completed) production plans (default)
+    scope=completed -> completed production plans
+    scope=all       -> every production plan
+    """
+    if scope not in ("active", "completed", "all"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="scope must be 'active', 'completed' or 'all'")
+    stmt = select(ProductionOrder)
+    if scope == "active":
+        stmt = stmt.where(ProductionOrder.status != ProductionStatus.completed)
+    elif scope == "completed":
+        stmt = stmt.where(ProductionOrder.status == ProductionStatus.completed)
+    if product_id:
+        stmt = stmt.where(ProductionOrder.product_id == product_id)
+    rows = db.scalars(
+        stmt.order_by(ProductionOrder.report_date.desc(), ProductionOrder.id.desc())
+    ).all()
 
+    headers = ["Order No", "Item Code", "Model", "Category", "Customer",
+               "Local Order", "Section", "Schedule Qty", "Ask Till Date",
+               "Production Qty", "% Comp", "Balance Qty", "Opening Stock",
+               "Status", "Start Date", "Completion Date", "Report Date", "Remarks"]
+    data = []
+    for o in rows:
+        p = o.product
+        cust = o.customer
+        is_trading = bool(p and p.category == ProductCategory.trading)
+        data.append([
+            o.order_no,
+            p.item_code if p else "",
+            p.model if p else "",
+            "Trading" if is_trading else "Manufacturing",
+            cust.name if cust else "",
+            o.sales_order.order_no if o.sales_order else "",
+            o.section or "",
+            o.schedule_qty if o.schedule_qty is not None else "",
+            o.ask_till_date if o.ask_till_date is not None else "",
+            o.produced_qty if o.produced_qty is not None else "",
+            round(float(o.completion_pct or 0) * 100, 2),
+            o.balance_qty if o.balance_qty is not None else "",
+            o.opening_stock if o.opening_stock is not None else "",
+            o.status.value,
+            o.start_date or "",
+            o.completion_date or "",
+            o.report_date or "",
+            o.remarks or "",
+        ])
 
-@router.post("/import", response_model=dict)
-async def import_production_plans(
-    db: Annotated[Session, Depends(get_db)],
-    user: AllStaff,
-    file: UploadFile = File(...),
-    confirm_duplicates: bool = Query(False, description="Import rows even if they appear to duplicate existing production plans"),
-):
-    """Bulk-create production orders from a CSV/Excel upload (after preview)."""
-    content = await file.read()
-    try:
-        headers, rows = read_table(file.filename or "upload.xlsx", content)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    if not rows:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No data rows found in file")
-
-    preview = _parse_production_import_rows(db, headers, rows, file.filename or "upload", resolve=True)
-    valid = preview["parsed"]
-
-    if preview["duplicate_rows"] and not confirm_duplicates:
-        db.rollback()
-        dup_details = [
-            {"row": r["row"], "item_code": r["item_code"], "model": r["model"],
-             "existing_order_no": r["duplicate_of"]["order_no"]}
-            for r in valid if r.get("duplicate_of")
-        ]
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": f"{preview['duplicate_rows']} row(s) appear to duplicate existing production plans from this month. Confirm to import anyway.",
-                "duplicates": dup_details,
-            },
-        )
-
-    created = _create_production_from_rows(db, valid, user)
-    db.commit()
-    return {
-        "summary": {
-            "total_rows": preview["total_rows"],
-            "valid_rows": len(valid),
-            "created": len(created),
-            "errors": len(preview["errors"]),
-            "warnings": preview["warning_rows"],
-        },
-        "created": created,
-        "errors": preview["errors"],
-    }
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(headers)
+    writer.writerows(data)
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode("utf-8-sig")),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename=production_{scope}.csv"},
+    )
 
 
 @router.get("/{order_id}", response_model=dict)
@@ -580,12 +362,14 @@ def update_production(order_id: int, body: ProductionOrderUpdate,
         c = get_or_create_customer(db, body.customer_name)
         if c:
             o.customer_id = c.id
-    apply_updates(o, body, exclude={"produced_qty", "customer_name"})
+    changes = apply_updates(o, body, exclude={"produced_qty", "customer_name"})
     o.produced_qty = sum(float(m.quantity or 0) for m in o.movements)
     _recalc_status(o)
+    _sync_completed_to_local_order(db, o)
     db.commit()
     db.refresh(o)
-    write_audit(db, user, "UPDATE", "production_orders", o.id, f"Updated production order {o.order_no}")
+    write_audit(db, user, "UPDATE", "production_orders", o.id, f"Updated production order {o.order_no}",
+                changes=changes)
     return _serialize_po(db, o)
 
 
@@ -610,7 +394,8 @@ def complete_production(order_id: int, db: Annotated[Session, Depends(get_db)], 
     if not o.completion_date:
         o.completion_date = date.today()
     _recalc_status(o)
-    
+    _sync_completed_to_local_order(db, o)
+
     db.commit()
     db.refresh(o)
     write_audit(db, user, "UPDATE", "production_orders", o.id, f"Completed production order {o.order_no}")
@@ -628,6 +413,7 @@ def add_movement(order_id: int, quantity: float, production_date: str,
     db.add(ProductionMovement(production_order_id=o.id, quantity=quantity, production_date=d))
     o.produced_qty += quantity
     _recalc_status(o)
+    _sync_completed_to_local_order(db, o)
     # finished goods increase
     apply_movement(db, o.product_id, MovementType.production_output, quantity,
                    d, ref_type="production_order", ref_id=o.id,
@@ -671,3 +457,396 @@ def delete_production(order_id: int, db: Annotated[Session, Depends(get_db)],
     db.commit()
     write_audit(db, user, "DELETE", "production_orders", order_id, f"Deleted production order {o.order_no}")
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------------------------------------------------------------------------
+# Production Plan bulk import (CSV / Excel)
+# ---------------------------------------------------------------------------
+_PRODUCTION_IMPORT_ALIASES = {
+    "item_code": ["Item Code", "ITEM CODE", "item_code", "ItemCode", "Item", "Code", "Product Code"],
+    "model": ["Model", "MODEL", "Product Model", "Size / Description", "Description", "Size", "Product"],
+    "customer": ["Customer", "CUSTOMER", "Customer Name", "Client", "Party", "Buyer"],
+    "schedule_qty": ["Schedule", "SCHEDULE", "Schedule Qty", "Schedule Quantity", "Planned Qty", "Planned Quantity", "Qty", "Quantity"],
+    "ask_till_date": ["Ask Till Date", "ASK TILL DATE", "Ask Till", "ask_till_date", "Till Date", "Ask Date"],
+    "produced_qty": ["Production Qty", "PRODUCTION QTY", "Production Quantity", "Produced Qty", "Produced Quantity"],
+    "completion_pct": ["% Comp", "% COMP", "Completion %", "Completion Percent", "% Completion", "Completion Percentage"],
+    "balance_qty": ["Balance Qty", "BALANCE QTY", "Balance Quantity"],
+    "status": ["Status", "STATUS"],
+    "category": ["Category", "CATEGORY", "Type", "Product Type", "Source Type", "Source"],
+    "remarks": ["Remarks", "REMARKS", "Notes", "Note", "Comments"],
+}
+
+
+def _excel_serial(d: date) -> float:
+    """Convert a date to an Excel serial day number (1899-12-30 epoch)."""
+    return (d - date(1899, 12, 30)).days
+
+
+def _extract_leading_number(v: Any) -> float | None:
+    """Parse a number, tolerating common unit suffixes such as '5 BOX' or '1000 kg'."""
+    n = cell_num(v)
+    if n is not None:
+        return n
+    s = cell_text(v)
+    if not s:
+        return None
+    m = re.match(r"\s*(\d+(?:\.\d+)?)", s)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _parse_ask_till_date(v: Any) -> tuple[float | None, str | None]:
+    """Parse Ask Till Date as a numeric value. Supports plain numbers and
+    common date formats (stored as Excel serial to fit the Float column)."""
+    if v is None or v == "":
+        return None, None
+    if isinstance(v, datetime):
+        return float(_excel_serial(v.date())), None
+    if isinstance(v, date):
+        return float(_excel_serial(v)), None
+    num = cell_num(v)
+    if num is not None:
+        return num, None
+    parsed = parse_date_value(v)
+    if parsed:
+        return float(_excel_serial(parsed)), None
+    return None, f"Cannot parse '{v}' as a date or number"
+
+
+def _parse_status(v: Any) -> tuple[str | None, str | None]:
+    """Case-insensitive ProductionStatus value lookup."""
+    s = cell_text(v)
+    if not s:
+        return "Planned", None
+    target = s.lower()
+    for member in ProductionStatus:
+        if member.value.lower() == target:
+            return member.value, None
+    valid = ", ".join(m.value for m in ProductionStatus)
+    return None, f"Invalid status '{v}'. Must be one of: {valid}"
+
+
+def _parse_production_import(headers: list[str], rows: list[list[Any]]) -> tuple[list[dict], list[dict]]:
+    """Parse uploaded Production Plan rows for preview.
+
+    Returns (valid_rows, error_rows). Blank optional values are preserved as
+    null/0 according to the model defaults; no values are invented.
+    """
+    colmap = build_column_map(headers, _PRODUCTION_IMPORT_ALIASES)
+    valid_rows: list[dict] = []
+    error_rows: list[dict] = []
+
+    for row_idx, row in enumerate(rows, start=1):
+        mapped = row_to_dict(colmap, row)
+        if is_blank_row(mapped):
+            continue
+
+        row_data: dict[str, Any] = {}
+        row_errors: list[str] = []
+
+        item_code = cell_text(mapped.get("item_code"))
+        model = cell_text(mapped.get("model"))
+        row_data["item_code"] = item_code or None
+        row_data["model"] = model or None
+
+        # Product identity: at least one of item_code or model is required.
+        if not item_code and not model:
+            row_errors.append("Missing item code or model")
+
+        # Customer is optional; keep blank if absent.
+        row_data["customer"] = cell_text(mapped.get("customer")) or None
+
+        # Schedule quantity: required positive number (tolerates '5 BOX').
+        schedule_qty = _extract_leading_number(mapped.get("schedule_qty"))
+        if schedule_qty is None or schedule_qty <= 0:
+            row_errors.append("Missing or invalid schedule quantity")
+        row_data["schedule_qty"] = schedule_qty
+
+        # Ask Till Date: numeric / date parser.
+        ask_till, ask_err = _parse_ask_till_date(mapped.get("ask_till_date"))
+        if ask_err:
+            row_errors.append(ask_err)
+        row_data["ask_till_date"] = ask_till
+
+        # Production Qty: optional numeric, blank stays null (tolerates units).
+        produced_qty = _extract_leading_number(mapped.get("produced_qty"))
+        row_data["produced_qty"] = produced_qty
+
+        # % Comp: optional numeric, blank stays null.
+        completion_pct = cell_num(mapped.get("completion_pct"))
+        row_data["completion_pct"] = completion_pct
+
+        # Balance Qty: optional numeric, blank stays null (tolerates units).
+        balance_qty = _extract_leading_number(mapped.get("balance_qty"))
+        row_data["balance_qty"] = balance_qty
+
+        # Status: optional, defaults to Planned.
+        status_value, status_err = _parse_status(mapped.get("status"))
+        if status_err:
+            row_errors.append(status_err)
+        row_data["status"] = status_value
+
+        # Category: optional, defaults to Manufacturing.
+        cat_raw = cell_text(mapped.get("category")) or "Manufacturing"
+        row_data["category"] = cat_raw
+
+        # Remarks: optional text.
+        row_data["remarks"] = cell_text(mapped.get("remarks")) or None
+
+        if row_errors:
+            error_rows.append({
+                "row": row_idx,
+                "errors": row_errors,
+                "data": {k: v for k, v in row_data.items() if k in (
+                    "item_code", "model", "customer", "schedule_qty", "ask_till_date",
+                    "produced_qty", "completion_pct", "balance_qty", "status", "category", "remarks")},
+            })
+        else:
+            valid_rows.append(row_data)
+
+    return valid_rows, error_rows
+
+
+def _resolve_production_product(
+    db: Session, item_code: str, model: str, category: str = "Manufacturing"
+) -> Product | None:
+    """Resolve or create a product for a production plan/import.
+
+    Existing products are always reused unchanged. New products are classified
+    according to the chosen plan category:
+      - Manufacturing -> category=finished, source_type=MANUFACTURED
+      - Trading       -> category=trading,  source_type=TRADING
+    """
+    ic = (item_code or "").strip()
+    md = (model or "").strip()
+    if not ic and not md:
+        return None
+
+    # Reuse existing product by item code or model.
+    if ic:
+        existing = db.scalars(select(Product).where(Product.item_code == ic).limit(1)).first()
+        if existing:
+            return existing
+    if md:
+        existing = db.scalars(select(Product).where(Product.model == md).limit(1)).first()
+        if existing:
+            return existing
+
+    # No match — create with the selected production category.
+    is_trading = category.strip().lower() in ("trading", "trade", "trading goods")
+    if not ic:
+        md = _unique_blank_model(db, md)
+    name = md or ic
+    prod = Product(
+        item_code=ic,
+        model=md or name,
+        name=name,
+        category=ProductCategory.trading if is_trading else ProductCategory.finished,
+        source_type=ProductSourceType.trading if is_trading else ProductSourceType.manufactured,
+        uom="Each",
+        is_active=True,
+    )
+    db.add(prod)
+    db.flush()
+    return prod
+
+
+def _resolve_import_entities(db: Session, rows: list[dict]) -> list[dict]:
+    """Resolve products and customers for parsed rows. Returns enriched rows
+    with product_id, customer_id, and warnings."""
+    for r in rows:
+        item_code = r.get("item_code") or ""
+        model = r.get("model") or ""
+        category = r.get("category") or "Manufacturing"
+        prod = _resolve_production_product(db, item_code, model, category)
+        r["product_id"] = prod.id if prod else None
+        r["product_model"] = prod.model if prod else (model or None)
+
+        customer_name = r.get("customer") or ""
+        if customer_name:
+            cust = get_or_create_customer(db, customer_name, "", "")
+            r["customer_id"] = cust.id if cust else None
+            r["customer_name"] = cust.name if cust else customer_name
+        else:
+            r["customer_id"] = None
+            r["customer_name"] = None
+    return rows
+
+
+def _find_duplicates(db: Session, rows: list[dict], report_date: date) -> list[dict]:
+    """Return rows that appear to duplicate an existing ProductionOrder for
+    the same product on the same report date with identical key fields.
+
+    The key always includes product, report_date, schedule_qty and status.
+    Optional fields (ask_till_date, produced_qty, completion_pct, balance_qty)
+    are only compared when the import row actually supplies them, so blank
+    optional cells do not prevent duplicate detection.
+    """
+    duplicates: list[dict] = []
+    for r in rows:
+        pid = r.get("product_id")
+        if pid is None:
+            continue
+        status_member = ProductionStatus(r.get("status") or "Planned")
+        filters = [
+            ProductionOrder.product_id == pid,
+            ProductionOrder.report_date == report_date,
+            ProductionOrder.schedule_qty == (r.get("schedule_qty") or 0),
+            ProductionOrder.status == status_member,
+        ]
+        if r.get("ask_till_date") is not None:
+            filters.append(ProductionOrder.ask_till_date == r["ask_till_date"])
+        if r.get("produced_qty") is not None:
+            filters.append(ProductionOrder.produced_qty == r["produced_qty"])
+        if r.get("completion_pct") is not None:
+            filters.append(ProductionOrder.completion_pct == r["completion_pct"])
+        if r.get("balance_qty") is not None:
+            filters.append(ProductionOrder.balance_qty == r["balance_qty"])
+        existing = db.scalar(select(ProductionOrder.id).where(*filters).limit(1))
+        if existing:
+            r["_duplicate"] = True
+            duplicates.append(r)
+    return duplicates
+
+
+def _create_production_orders(db: Session, rows: list[dict], user, report_date: date) -> list[ProductionOrder]:
+    """Create ProductionOrder records from validated, entity-resolved rows.
+
+    Each order is flushed individually so the generated order_no sequence is
+    visible to the next _next_no() call within the same transaction.
+    """
+    created: list[ProductionOrder] = []
+    for r in rows:
+        schedule = float(r.get("schedule_qty") or 0)
+        produced = float(r.get("produced_qty") or 0)
+        completion = r.get("completion_pct")
+        balance = r.get("balance_qty")
+        if balance is None:
+            balance = schedule - produced
+        status_val = r.get("status") or "Planned"
+        status_member = ProductionStatus(status_val)
+        o = ProductionOrder(
+            order_no=_next_no(db),
+            product_id=r.get("product_id"),
+            customer_id=r.get("customer_id"),
+            section="",
+            schedule_qty=schedule,
+            ask_till_date=r.get("ask_till_date"),
+            produced_qty=produced,
+            completion_pct=completion,
+            balance_qty=balance,
+            opening_stock=0,
+            status=status_member,
+            report_date=report_date,
+            remarks=r.get("remarks") or "",
+        )
+        db.add(o)
+        db.flush()
+        created.append(o)
+    return created
+
+
+@router.post("/import", response_model=dict)
+async def import_production_plans(
+    file: Annotated[UploadFile, File(...)],
+    db: Annotated[Session, Depends(get_db)],
+    user: AllStaff,
+    confirm: bool = Query(False, description="Set true to create records after preview"),
+    force: bool = Query(False, description="Set true to create despite possible duplicates"),
+):
+    """Import Production Plans from CSV or Excel file.
+
+    Supported columns (any order, flexible naming):
+    - Item Code / Model / Customer / Schedule / Ask Till Date /
+      Production Qty / % Comp / Balance Qty / Status / Remarks
+    - Extra columns are ignored.
+    - Column headers are case-insensitive and space/underscore tolerant.
+
+    First call returns a preview. Call again with confirm=true to save.
+    """
+    content = await file.read()
+    filename = file.filename or "production_import.csv"
+
+    try:
+        headers, rows = read_table(filename, content)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+
+    valid_rows, error_rows = _parse_production_import(headers, rows)
+    report_date = date.today()
+
+    if not confirm:
+        return {
+            "preview": {
+                "filename": filename,
+                "total_rows": len(rows),
+                "valid_rows": len(valid_rows),
+                "error_rows": len(error_rows),
+                "mapped_columns": {headers[idx]: canon for idx, canon in build_column_map(headers, _PRODUCTION_IMPORT_ALIASES).items()},
+                "detected_fields": list(build_column_map(headers, _PRODUCTION_IMPORT_ALIASES).values()),
+                "headers": headers,
+                "valid_data": valid_rows,
+                "error_details": error_rows,
+            },
+            "message": "Review the preview and call again with confirm=true to import.",
+        }
+
+    if not valid_rows:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No valid rows to import")
+
+    # Resolve products/customers and check duplicates on confirm (valid rows only).
+    resolved = _resolve_import_entities(db, valid_rows)
+    duplicates = _find_duplicates(db, resolved, report_date)
+
+    if duplicates and not force:
+        dup_summary = [
+            {"row": i + 1, "item_code": d.get("item_code"), "model": d.get("model")}
+            for i, d in enumerate(resolved) if d.get("_duplicate")
+        ]
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": f"{len(duplicates)} row(s) match existing Production Orders. Pass force=true to create them anyway.",
+                "duplicates": dup_summary,
+            },
+        )
+
+    created = _create_production_orders(db, resolved, user, report_date)
+    db.commit()
+    for o in created:
+        write_audit(db, user, "CREATE", "production_orders", o.id,
+                    f"Imported production plan {o.order_no}")
+    if error_rows:
+        write_audit(db, user, "IMPORT", "production_orders", None,
+                    f"Production import: {len(created)} created, {len(error_rows)} failed",
+                    failed=len(error_rows))
+
+    return {
+        "created": len(created),
+        "filename": filename,
+        "message": f"Imported {len(created)} production plan(s). Skipped {len(error_rows)} invalid row(s)." if error_rows else f"Imported {len(created)} production plan(s).",
+        "orders": [{"id": o.id, "order_no": o.order_no, "model": o.product.model if o.product else (o.product_id)} for o in created],
+        "skipped_rows": len(error_rows),
+        "errors": error_rows,
+    }
+
+
+@router.get("/import/template")
+def download_production_import_template():
+    """Download a blank Production Plan import template (CSV)."""
+    import csv
+    import io
+    from fastapi.responses import StreamingResponse
+
+    headers = ["Item Code", "Model", "Customer", "Schedule", "Ask Till Date",
+               "Production Qty", "% Comp", "Balance Qty", "Status", "Remarks"]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(headers)
+    w.writerow(["SF001", "Stretch Film", "", "100", "", "50", "", "", "Planned", ""])
+    return StreamingResponse(
+        io.BytesIO(buf.getvalue().encode("utf-8-sig")),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": "attachment; filename=production_plan_template.csv"},
+    )

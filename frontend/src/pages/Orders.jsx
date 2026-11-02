@@ -902,8 +902,8 @@ export default function Orders() {
                 { key: 'status', label: 'Status', render: (r) => <StatusBadge status={r.status} /> },
                 { key: 'actions', label: '', render: (r) => (
                   <div className="flex items-center justify-end gap-1">
-                    <button onClick={(e) => { e.stopPropagation(); setDetail(r) }} className="text-slate-400 hover:text-slate-700 p-1 hover:bg-gray-100 rounded" title="View order"><Eye size={15} /></button>
-                    <button onClick={(e) => { e.stopPropagation(); openEdit(r) }} className="text-slate-400 hover:text-blue-600 p-1 hover:bg-blue-50 rounded" title="Edit order"><Pencil size={14} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); closeCustomerDetail(); openDetail(r) }} className="text-slate-400 hover:text-slate-700 p-1 hover:bg-gray-100 rounded" title="View order"><Eye size={15} /></button>
+                    <button onClick={(e) => { e.stopPropagation(); closeCustomerDetail(); openEdit(customerDetail.orders.find((o) => o.id === r.order_id)) }} className="text-slate-400 hover:text-blue-600 p-1 hover:bg-blue-50 rounded" title="Edit order"><Pencil size={14} /></button>
                     <button onClick={(e) => { e.stopPropagation(); shareOrder(r) }} className="text-slate-400 hover:text-green-600 p-1 hover:bg-green-50 rounded" title="Share order"><Share2 size={14} /></button>
                     <button onClick={(e) => { e.stopPropagation(); downloadPDF(r) }} className="text-slate-400 hover:text-purple-600 p-1 hover:bg-purple-50 rounded" title="Download PDF"><FileText size={14} /></button>
                     <button onClick={(e) => { e.stopPropagation(); removeOrder(r) }} className="text-slate-400 hover:text-red-600 p-1 hover:bg-red-50 rounded" title="Delete order"><Trash2 size={14} /></button>
@@ -994,16 +994,26 @@ export default function Orders() {
       <Modal open={importOpen} title="Import Orders" onClose={closeImport} xwide
         footer={<>
           <button onClick={closeImport} className="btn btn-secondary" disabled={importLoading}>Cancel</button>
-          {importPreview?.can_import && (
-            <button onClick={() => runImport(importConfirm)} disabled={importLoading} className="btn btn-primary">
-              {importLoading ? 'Importing…' : (importConfirm ? 'Import Anyway' : 'Import Orders')}
-            </button>
-          )}
+          <button onClick={() => runImport(importConfirm)} disabled={importLoading || !importPreview?.can_import} className="btn btn-primary">
+            {importLoading ? 'Importing…' : 'Import Orders'}
+          </button>
         </>}>
         <div className="space-y-4 text-sm">
           <div className="flex items-center gap-3 p-3 bg-slate-50 rounded-lg border border-gray-100">
-            <button onClick={() => fileInputRef.current?.click()} className="btn btn-secondary" disabled={importLoading}><Upload size={14} /> Select File</button>
-            <span className="text-slate-500">{fileInputRef.current?.files?.[0]?.name || importPreview?.file_name || 'CSV or Excel (.xlsx, .xls)'}</span>
+            <button onClick={() => fileInputRef.current?.click()} className="btn btn-secondary" disabled={importLoading}><Upload size={14} /> Choose CSV / Excel</button>
+            <div className="text-sm">
+              {(() => {
+                const f = fileInputRef.current?.files?.[0]
+                if (!f) return <span className="text-slate-500">No file selected (.csv, .xlsx, .xls)</span>
+                const ext = f.name.split('.').pop().toUpperCase()
+                return (
+                  <div>
+                    <div className="font-medium text-slate-700">{f.name}</div>
+                    <div className="text-xs text-slate-500">Type: {f.type || ext}</div>
+                  </div>
+                )
+              })()}
+            </div>
           </div>
 
           {importLoading && <Loading text="Analysing file…" />}
@@ -1023,7 +1033,15 @@ export default function Orders() {
 
               {importPreview.duplicate_rows > 0 && (
                 <div className="rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-sm px-3 py-2">
-                  {importPreview.duplicate_rows} row(s) match existing orders. Click <b>Import Anyway</b> to create them regardless, or cancel and review the source file.
+                  {importPreview.duplicate_rows} row(s) match existing orders. Click <b>Import Orders</b> to create them regardless, or cancel and review the source file.
+                </div>
+              )}
+
+              {Object.keys(importPreview.mapped_columns || {}).length === 0 && (
+                <div className="rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-sm px-3 py-2">
+                  <p className="font-medium mb-1">No recognized order columns found.</p>
+                  <p className="text-xs mb-1">Raw headers detected: <span className="font-mono">{(importPreview.headers || []).join(', ') || '—'}</span></p>
+                  <p className="text-xs">Please use the template or check that headers match PO NO, SO No, ITEM CODE, MODEL, SCHEDULE, Customer, ASK TILL DATE, DISPATCH, % COMP, BALANCE QTY, OPNING STOCK.</p>
                 </div>
               )}
 
@@ -1104,8 +1122,13 @@ export default function Orders() {
           {emailError && (
             <div className="rounded-lg bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2">{emailError}</div>
           )}
+          {!emailForm.to && (
+            <div className="rounded-lg bg-amber-50 border border-amber-200 text-amber-800 text-sm px-3 py-2">
+              Customer has no email on record. Please type the recipient email below.
+            </div>
+          )}
           <div>
-            <label className="block text-slate-500 text-xs mb-1">To</label>
+            <label className="block text-slate-500 text-xs mb-1">To <span className="text-red-500">*</span></label>
             <input type="email" value={emailForm.to} onChange={(e) => setEmailForm({ ...emailForm, to: e.target.value })} className="input" placeholder="customer@example.com" />
           </div>
           <div>

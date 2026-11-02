@@ -21,7 +21,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Response, UploadFile, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import Integer, delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..auth import CurrentUser, AllStaff, ManagerOrAdmin
@@ -29,8 +29,8 @@ from ..crud import write_audit
 from ..database import get_db
 from ..models import (
     Customer, Dispatch, DispatchLine, ImportBatch, OrderStatus, OrderType, Plan,
-    Product, ProductionOrder, PurchaseRequirement, SalesOrder,
-    SalesOrderLine,
+    Product, ProductCategory, ProductSourceType, ProductionOrder, ProductionStatus,
+    PurchaseRequirement, SalesOrder, SalesOrderLine,
 )
 from ..schemas import LocalOrderCreate, LocalOrderUpdate
 from ..services import reorder_alerts as re_alerts
@@ -41,19 +41,113 @@ from ..services.import_common import (
 )
 from ..services.local_orders import (
     check_ready, normalize_local_type, serialize_local_order,
-    sync_local_order_status,
+    sync_local_order_production_completion, sync_local_order_status,
 )
 from ..services.stock_service import resolve_or_create_product
+from ..routers.production import _resolve_production_product, _next_no as _prod_next_no
 from datetime import date
 
 router = APIRouter(prefix="/local-orders", tags=["local-orders"])
 
 
 def _local_no(db: Session) -> str:
-    prefix = f"LOC-{date.today().strftime('%Y%m%d')}-"
-    n = db.scalar(select(func.max(func.cast(func.substr(SalesOrder.order_no, len(prefix) + 1), Integer)))
-                  .where(SalesOrder.order_no.like(f"{prefix}%"))) or 0
+    """Next short local-order number: LOC-001, LOC-002, …
+
+    Only the numeric short format is considered, so legacy date-stamped numbers
+    (LOC-YYYYMMDD-NNN) are ignored and never collide with the new sequence.
+    """
+    prefix = "LOC-"
+    existing = db.scalars(
+        select(SalesOrder.order_no).where(SalesOrder.order_no.like(f"{prefix}%"))
+    ).all()
+    n = max((int(x[len(prefix):]) for x in existing
+             if x and x[len(prefix):].isdigit()), default=0)
     return f"{prefix}{n + 1:03d}"
+
+
+def _ensure_local_order_production_plan(db: Session, o: SalesOrder) -> list[ProductionOrder]:
+    """Create one ProductionOrder per Manufacturing Local Order line when the
+    order reaches 'Production In Progress' status.
+
+    Existing per-line plans are reused. Missing plans are created for new lines
+    or lines that were added after production started. Aggregate plans without
+    a line link are left untouched for historical compatibility.
+    """
+    created: list[ProductionOrder] = []
+    if o.order_type != OrderType.local:
+        return created
+    if normalize_local_type(o.local_order_type) != "MANUFACTURING":
+        return created
+    if o.status != OrderStatus.production_in_process:
+        return created
+
+    # Newly added lines need persisted ids before we can link plans to them.
+    db.flush()
+
+    customer_id = o.customer_id
+    if not customer_id and o.customer_name:
+        c = get_or_create_customer(db, o.customer_name, "", "")
+        if c:
+            customer_id = c.id
+
+    for ln in o.lines:
+        # Resolve the product for this specific line.
+        product = None
+        if ln.product_id:
+            product = db.get(Product, ln.product_id)
+        if product is None:
+            product = _resolve_production_product(
+                db, ln.item_code or "", ln.description or ln.model or "", category="Manufacturing"
+            )
+        if product is None:
+            # Skip lines that cannot be tied to a product; do not block the order.
+            continue
+
+        # Manufacturing plans must be classified as finished/MANUFACTURED.
+        if product.category != ProductCategory.finished or product.source_type != ProductSourceType.manufactured:
+            product.category = ProductCategory.finished
+            product.source_type = ProductSourceType.manufactured
+            db.flush()
+
+        existing = db.scalars(
+            select(ProductionOrder)
+            .where(
+                ProductionOrder.sales_order_id == o.id,
+                ProductionOrder.sales_order_line_id == ln.id,
+            )
+            .limit(1)
+        ).first()
+
+        if existing:
+            # Only safe schedule sync: update the target when no actual production
+            # has been recorded yet. Never overwrite active production history.
+            if existing.produced_qty == 0 and not existing.movements:
+                existing.schedule_qty = float(ln.quantity or 0)
+                existing.balance_qty = existing.schedule_qty
+            created.append(existing)
+            continue
+
+        po = ProductionOrder(
+            order_no=_prod_next_no(db),
+            product_id=product.id,
+            customer_id=customer_id,
+            sales_order_id=o.id,
+            sales_order_line_id=ln.id,
+            schedule_qty=float(ln.quantity or 0),
+            produced_qty=0,
+            opening_stock=0,
+            balance_qty=float(ln.quantity or 0),
+            status=ProductionStatus.in_production,
+            report_date=date.today(),
+            remarks=f"Auto-created from Local Order {o.order_no} line {ln.id}",
+        )
+        db.add(po)
+        db.flush()
+        created.append(po)
+
+    if created:
+        sync_local_order_production_completion(db, o.id)
+    return created
 
 
 def _t(v) -> str:
@@ -204,6 +298,15 @@ def _apply_lines(db: Session, o: SalesOrder, raw_lines) -> None:
         if used:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                                 detail=f"Line '{ln.description or ln.id}' already has dispatch entries and cannot be removed")
+        has_production_plan = db.scalar(
+            select(func.count()).select_from(ProductionOrder)
+            .where(ProductionOrder.sales_order_line_id == ln.id)
+        ) or 0
+        if has_production_plan:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Line '{ln.description or ln.id}' has a production plan and cannot be removed",
+            )
         db.delete(ln)
 
 
@@ -428,7 +531,12 @@ async def import_local_orders(
 
     for cr in created:
         write_audit(db, user, "IMPORT", "sales_orders", cr["order_id"],
-                    f"Bulk-imported LOCAL order {cr['order_no']} ({cr['lines']} lines)")
+                    f"Bulk-imported LOCAL order {cr['order_no']} ({cr['lines']} lines)",
+                    created=1)
+    if errors_rows:
+        write_audit(db, user, "IMPORT", "sales_orders", None,
+                    f"Local order import: {len(created)} created, {len(errors_rows)} failed",
+                    failed=len(errors_rows))
     batch.stats = json.dumps({
         "rows": len(parsed), "created": len(created), "skipped": 0,
         "errors": len(errors_rows), "lines": line_count, "source": file.filename or "",
@@ -482,6 +590,64 @@ def local_orders_report_csv(db: Annotated[Session, Depends(get_db)], _: CurrentU
         ])
     db.commit()
     return _csv_response(headers, data, "local_orders_completed.csv")
+
+
+@router.get("/report/active")
+def local_orders_active_report_csv(db: Annotated[Session, Depends(get_db)], _: CurrentUser):
+    """Current (active / not-yet-completed) LOCAL orders as a CSV report.
+
+    One row per order line so every line item is its own row ("saare rows"),
+    with all order/customer/stock columns repeated. Orders that have no lines
+    are still emitted (blank line columns) so no current order is dropped.
+    Completed orders are excluded here — they live in /report/orders.
+    """
+    rows = db.scalars(select(SalesOrder)
+                      .where(SalesOrder.order_type == OrderType.local)
+                      .order_by(SalesOrder.order_date.desc(), SalesOrder.id.desc())).all()
+    headers = ["Order No", "SO Number", "PO Number", "Customer", "Mobile", "Email",
+               "Order Type", "Order Date", "Delivery Date", "Status",
+               "Order Qty", "Dispatched", "Pending", "Total Amount",
+               "Main Store Stock", "Dispatch Stock", "Transfer Required", "Created At",
+               "Line ID", "Item Code", "Size / Description", "Product Model",
+               "Unit", "Line Qty", "Rate", "Less", "Line Amount",
+               "Line Dispatched", "Line Pending"]
+    data = []
+    for o in rows:
+        sync_local_order_status(db, o)
+        s = _serialize(db, o)
+        if s["status"] == "Completed":
+            continue
+        summary = s.get("stock_summary") or {}
+        created = s.get("created_at")
+        header = [
+            s["order_no"], s.get("so_no") or "", s.get("customer_po_no") or "",
+            s.get("customer") or "", s.get("customer_mobile") or "",
+            s.get("customer_email") or "", s.get("order_type") or "",
+            s.get("order_date") or "", s.get("delivery_date") or "",
+            s.get("status") or "", s.get("quantity") or 0,
+            s.get("dispatched_qty") or 0, s.get("pending_qty") or 0,
+            s.get("total_value") or 0,
+            summary.get("main_store_stock") or 0,
+            summary.get("dispatch_stock") or 0,
+            "Yes" if summary.get("transfer_required") else "No",
+            created.isoformat() if hasattr(created, "isoformat") else (created or ""),
+        ]
+        lines = s.get("lines") or []
+        if not lines:
+            data.append(header + [""] * 11)
+            continue
+        for ln in lines:
+            data.append(header + [
+                ln.get("id"), ln.get("item_code") or "",
+                ln.get("description") or "", ln.get("model") or "",
+                ln.get("uom") or "", ln.get("quantity") or 0,
+                ln.get("rate") if ln.get("rate") is not None else "",
+                ln.get("less") if ln.get("less") is not None else "",
+                ln.get("amount") or 0,
+                ln.get("dispatched_qty") or 0, ln.get("balance_qty") or 0,
+            ])
+    db.commit()
+    return _csv_response(headers, data, "local_orders_active.csv")
 
 
 @router.get("/report/plans")
@@ -566,11 +732,13 @@ def create_local_order(body: LocalOrderCreate, db: Annotated[Session, Depends(ge
                    order_date=body.order_date or date.today(),
                    required_delivery_date=body.required_delivery_date,
                    status=OrderStatus.new, remarks=body.remarks or "",
+                   transport_name=(body.transport_name or "").strip()[:160],
                    lines=lines)
     _recalc_local_total(db, o, lines)
     db.add(o)
     db.flush()
     sync_local_order_status(db, o)
+    _ensure_local_order_production_plan(db, o)
     db.commit()
     db.refresh(o)
     write_audit(db, user, "CREATE", "sales_orders", o.id, f"Created LOCAL order {o.order_no}")
@@ -614,6 +782,8 @@ def update_local_order(order_id: int, body: LocalOrderUpdate,
         o.required_delivery_date = body.required_delivery_date
     if "remarks" in data and body.remarks is not None:
         o.remarks = body.remarks
+    if "transport_name" in data and body.transport_name is not None:
+        o.transport_name = (body.transport_name or "").strip()[:160]
     # Status is user-controlled: an explicit status in the request is stored
     # as-is and is never re-derived by stock/Production side effects.
     manual_status = "status" in data and body.status is not None
@@ -629,6 +799,7 @@ def update_local_order(order_id: int, body: LocalOrderUpdate,
 
     if not manual_status and o.status != OrderStatus.cancelled:
         sync_local_order_status(db, o)
+    _ensure_local_order_production_plan(db, o)
     db.commit()
     db.refresh(o)
     write_audit(db, user, "UPDATE", "sales_orders", o.id, f"Updated LOCAL order {o.order_no}")
@@ -645,7 +816,7 @@ def delete_local_order(order_id: int, db: Annotated[Session, Depends(get_db)],
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail="Cannot delete local order: it has dispatches.")
     db.execute(update(ProductionOrder).where(ProductionOrder.sales_order_id == o.id)
-               .values(sales_order_id=None))
+               .values(sales_order_id=None, sales_order_line_id=None))
     db.execute(update(Plan).where(Plan.sales_order_id == o.id).values(sales_order_id=None))
     db.execute(delete(PurchaseRequirement).where(PurchaseRequirement.sales_order_id == o.id))
     db.delete(o)

@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 from ..auth import CurrentUser, ManagerOrAdmin
 from ..crud import apply_updates, get_or_404, write_audit
 from ..database import get_db
-from ..models import PurchaseOrder, Supplier
+from ..models import Product, PurchaseOrder, PurchaseOrderLine, Supplier
 from ..schemas import SupplierCreate, SupplierOut, SupplierUpdate
 
 router = APIRouter(prefix="/suppliers", tags=["suppliers"])
@@ -56,14 +56,49 @@ def get_supplier(supplier_id: int, db: Annotated[Session, Depends(get_db)],
     return get_or_404(db, Supplier, supplier_id)
 
 
+@router.get("/{supplier_id}/purchase-history", response_model=dict)
+def supplier_purchase_history(supplier_id: int, db: Annotated[Session, Depends(get_db)],
+                              _: CurrentUser):
+    """Return purchase history for a supplier: distinct products and all PO lines."""
+    get_or_404(db, Supplier, supplier_id)
+    rows = (
+        db.query(PurchaseOrderLine, PurchaseOrder, Product)
+        .join(PurchaseOrder, PurchaseOrderLine.po_id == PurchaseOrder.id)
+        .outerjoin(Product, PurchaseOrderLine.product_id == Product.id)
+        .filter(PurchaseOrder.supplier_id == supplier_id)
+        .order_by(PurchaseOrder.order_date.desc(), PurchaseOrder.id.desc())
+        .all()
+    )
+    products = {}
+    history = []
+    for line, po, product in rows:
+        name = product.model if product else (line.description or line.item_code or "Unknown")
+        item_code = product.item_code if product else (line.item_code or "")
+        products[name] = {"name": name, "item_code": item_code}
+        history.append({
+            "po_number": po.po_number,
+            "order_date": po.order_date.isoformat() if po.order_date else None,
+            "product_name": name,
+            "item_code": item_code,
+            "quantity": float(line.quantity or 0),
+            "uom": line.uom or "",
+            "rate": float(line.rate) if line.rate is not None else None,
+            "amount": float(line.amount) if line.amount is not None else None,
+            "tax_percent": line.tax_percent,
+            "discount_percent": line.discount_percent,
+        })
+    return {"products": list(products.values()), "history": history}
+
+
 @router.patch("/{supplier_id}", response_model=SupplierOut)
 def update_supplier(supplier_id: int, body: SupplierUpdate, db: Annotated[Session, Depends(get_db)],
                     user: ManagerOrAdmin):
     sup = get_or_404(db, Supplier, supplier_id)
-    apply_updates(sup, body)
+    changes = apply_updates(sup, body)
     db.commit()
     db.refresh(sup)
-    write_audit(db, user, "UPDATE", "suppliers", sup.id, f"Updated supplier {sup.name}")
+    write_audit(db, user, "UPDATE", "suppliers", sup.id, f"Updated supplier {sup.name}",
+                changes=changes)
     return sup
 
 

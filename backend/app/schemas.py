@@ -4,11 +4,12 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 
 from .models import (
-    DispatchStatus, MovementType, OrderStatus, OrderType, PlanType, ProductCategory,
-    ProductionStatus, PurchaseStatus, UserRole,
+    DispatchStatus, EmployeeStatus, MovementType, OrderStatus, OrderType, PlanType,
+    PRNLineMode, PRNStatus, ProductCategory, ProductionStatus, PurchaseStatus,
+    QuotationStatus, QuotationType, UserRole, normalize_quotation_company,
 )
 
 
@@ -52,6 +53,10 @@ class TokenOut(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserOut
+    # Session policy surfaced to the client so it can enforce timeouts without
+    # hard-coding them (seconds). 0 = not configured.
+    expires_in: int = 0
+    inactivity_seconds: int = 0
 
 
 # ------------------------- Master -------------------------
@@ -126,6 +131,88 @@ class SupplierUpdate(BaseModel):
 class SupplierOut(SupplierBase, ORMModel):
     id: int
     is_active: bool
+    created_at: datetime
+
+
+class EmployeeBase(BaseModel):
+    employee_code: str = Field(min_length=1, max_length=60)
+    name: str = Field(min_length=1, max_length=160)
+    mobile: str = ""
+    email: str = ""
+    department: str = ""
+    designation: str = ""
+    joining_date: Optional[date] = None
+    # Sensitive (admin-only). Plain strings — format is validated in the router so
+    # validation errors never echo the submitted value back to the client.
+    aadhaar_number: str = ""
+    pan_number: str = ""
+    bank_account_number: str = ""
+    ifsc_code: str = ""
+    bank_name: str = ""
+    branch_name: str = ""
+    # Advanced Edit — statutory / payroll & verification (all optional). Choice
+    # fields use plain strings validated in the router (never echo submitted
+    # values), dates are optional and nullable.
+    pf_applicable: str = ""
+    uan: str = ""
+    pf_member_id: str = ""
+    pf_joining_date: Optional[date] = None
+    pf_exit_date: Optional[date] = None
+    previous_pf_membership: str = ""
+    esic_applicable: str = ""
+    esic_ip_number: str = ""
+    esic_joining_date: Optional[date] = None
+    esic_exit_date: Optional[date] = None
+    esic_registration_status: str = ""
+    verification_status: str = ""
+    verified_by: str = ""
+    verification_date: Optional[date] = None
+    remarks: str = ""
+    supporting_document_ref: str = ""
+    job_leave_date: Optional[date] = None
+    status: EmployeeStatus = EmployeeStatus.active
+
+
+class EmployeeCreate(EmployeeBase):
+    pass
+
+
+class EmployeeUpdate(BaseModel):
+    employee_code: Optional[str] = None
+    name: Optional[str] = None
+    mobile: Optional[str] = None
+    email: Optional[str] = None
+    department: Optional[str] = None
+    designation: Optional[str] = None
+    joining_date: Optional[date] = None
+    aadhaar_number: Optional[str] = None
+    pan_number: Optional[str] = None
+    bank_account_number: Optional[str] = None
+    ifsc_code: Optional[str] = None
+    bank_name: Optional[str] = None
+    branch_name: Optional[str] = None
+    pf_applicable: Optional[str] = None
+    uan: Optional[str] = None
+    pf_member_id: Optional[str] = None
+    pf_joining_date: Optional[date] = None
+    pf_exit_date: Optional[date] = None
+    previous_pf_membership: Optional[str] = None
+    esic_applicable: Optional[str] = None
+    esic_ip_number: Optional[str] = None
+    esic_joining_date: Optional[date] = None
+    esic_exit_date: Optional[date] = None
+    esic_registration_status: Optional[str] = None
+    verification_status: Optional[str] = None
+    verified_by: Optional[str] = None
+    verification_date: Optional[date] = None
+    remarks: Optional[str] = None
+    supporting_document_ref: Optional[str] = None
+    job_leave_date: Optional[date] = None
+    status: Optional[EmployeeStatus] = None
+
+
+class EmployeeOut(EmployeeBase, ORMModel):
+    id: int
     created_at: datetime
 
 
@@ -210,6 +297,7 @@ class PurchaseOrderLineIn(BaseModel):
     product_id: Optional[int] = None
     description: str = ""
     item_code: str = ""
+    make: str = ""
     quantity: float = 0
     received_qty: float = 0
     rate: Optional[float] = None
@@ -217,26 +305,43 @@ class PurchaseOrderLineIn(BaseModel):
     uom: str = ""
     tax_percent: Optional[float] = None
     discount_percent: Optional[float] = None
+    prn_line_id: Optional[int] = None
 
 
 class PurchaseOrderCreate(BaseModel):
     po_number: str = Field(min_length=1, max_length=120)
     supplier_id: Optional[int] = None
     supplier_name: str = ""
+    supplier_gstin: str = ""
+    supplier_address: str = ""
+    supplier_phone: str = ""
+    supplier_email: str = ""
     order_date: date = Field(default_factory=date.today)
+    valid_until: Optional[date] = None
     status: PurchaseStatus = PurchaseStatus.ordered
     notes: str = ""
     lines: list[PurchaseOrderLineIn] = []
+    prn_id: Optional[int] = None
+    idempotency_key: str = Field(default="", max_length=80)
+    po_type: str = "regular"
+    import_meta: dict = {}
 
 
 class PurchaseOrderUpdate(BaseModel):
     po_number: Optional[str] = None
     supplier_id: Optional[int] = None
     supplier_name: Optional[str] = None
+    supplier_gstin: Optional[str] = None
+    supplier_address: Optional[str] = None
+    supplier_phone: Optional[str] = None
+    supplier_email: Optional[str] = None
     order_date: Optional[date] = None
+    valid_until: Optional[date] = None
     status: Optional[PurchaseStatus] = None
     notes: Optional[str] = None
     lines: Optional[list[PurchaseOrderLineIn]] = None
+    po_type: Optional[str] = None
+    import_meta: Optional[dict] = None
 
 
 class PurchaseOrderLineOut(ORMModel):
@@ -244,6 +349,7 @@ class PurchaseOrderLineOut(ORMModel):
     product_id: Optional[int]
     description: str
     item_code: str = ""
+    make: str = ""
     quantity: float
     received_qty: float
     rate: Optional[float]
@@ -259,7 +365,9 @@ class PurchaseOrderOut(ORMModel):
     po_number: str
     supplier_id: Optional[int]
     order_date: date
+    valid_until: Optional[date] = None
     status: PurchaseStatus
+    po_type: str = "regular"
     total_amount: float
     notes: str
     created_at: datetime
@@ -468,7 +576,10 @@ class ProductionOrderCreate(BaseModel):
     opening_stock: float = 0
     customer_id: Optional[int] = None
     customer_name: str = ""
+    sales_order_id: Optional[int] = None
+    sales_order_line_id: Optional[int] = None
     status: ProductionStatus = ProductionStatus.planned
+    category: str = "Manufacturing"
     start_date: Optional[date] = None
     completion_date: Optional[date] = None
     report_date: date = Field(default_factory=date.today)
@@ -484,6 +595,8 @@ class ProductionOrderUpdate(BaseModel):
     opening_stock: Optional[float] = None
     customer_id: Optional[int] = None
     customer_name: Optional[str] = None
+    sales_order_id: Optional[int] = None
+    sales_order_line_id: Optional[int] = None
     status: Optional[ProductionStatus] = None
     start_date: Optional[date] = None
     completion_date: Optional[date] = None
@@ -514,6 +627,8 @@ class ProductionOrderOut(ORMModel):
     completion_date: Optional[date]
     report_date: date
     remarks: str
+    sales_order_id: Optional[int] = None
+    sales_order_line_id: Optional[int] = None
     product: Optional[ProductOut] = None
     movements: list[ProductionMovementOut] = []
 
@@ -627,6 +742,7 @@ class LocalOrderCreate(BaseModel):
     required_delivery_date: Optional[date] = None
     status: OrderStatus = OrderStatus.new
     remarks: str = ""
+    transport_name: str = ""
     lines: list[LocalOrderLineIn] = []
 
     _status = field_validator("status", mode="before")(_order_status)
@@ -644,6 +760,7 @@ class LocalOrderUpdate(BaseModel):
     local_order_type: Optional[str] = None
     status: Optional[OrderStatus] = None
     remarks: Optional[str] = None
+    transport_name: Optional[str] = None
     lines: Optional[list[LocalOrderLineIn]] = None
 
     _status = field_validator("status", mode="before")(_order_status)
@@ -694,6 +811,10 @@ class DispatchLineIn(BaseModel):
     rate: Optional[float] = None
     weight: Optional[float] = None
     sales_order_line_id: Optional[int] = None
+    # Product-wise planned quantity for THIS line. When omitted it is derived
+    # from the linked order line (schedule_qty ?? quantity); for lines with no
+    # order link it defaults to the dispatched quantity.
+    schedule_qty: Optional[float] = None
 
 
 class DispatchCreate(BaseModel):
@@ -977,8 +1098,330 @@ class EmailHistoryOut(BaseModel):
     sent_at: datetime
 
 
+# ---------------------------------------------------------------------------
+# Packaging List
+# ---------------------------------------------------------------------------
+class PackagingListLineIn(BaseModel):
+    id: Optional[int] = None
+    sr_no: int = 0
+    gross_wt: float = 0
+    # None means "use the list-level default less"
+    less: Optional[float] = None
+    net_wt: float = 0
+
+
+class PackagingListLineOut(BaseModel):
+    id: int
+    sr_no: int
+    gross_wt: float
+    less: float
+    net_wt: float
+
+
+class PackagingListCreate(BaseModel):
+    list_no: Optional[str] = None
+    list_date: date = Field(default_factory=date.today)
+    customer_id: Optional[int] = None
+    customer_name: str = ""
+    item_description: str = ""
+    less_default: float = 0
+    lines: list[PackagingListLineIn] = []
+
+
+class PackagingListUpdate(BaseModel):
+    list_no: Optional[str] = None
+    list_date: Optional[date] = None
+    customer_id: Optional[int] = None
+    customer_name: Optional[str] = None
+    item_description: Optional[str] = None
+    less_default: Optional[float] = None
+    lines: Optional[list[PackagingListLineIn]] = None
+
+
+class PackagingListOut(ORMModel):
+    id: int
+    list_no: str
+    list_date: date
+    customer_id: Optional[int]
+    customer_name: str
+    item_description: str
+    less_default: float
+    total_gross_wt: float
+    total_less: float
+    total_net_wt: float
+    lines: list[PackagingListLineOut]
+    created_by: Optional[UserMiniOut] = None
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+
 class PageOut(BaseModel):
     items: list[Any]
     total: int
     page: int
     page_size: int
+
+
+# ------------------------- Quotations -------------------------
+class UserMiniOut(ORMModel):
+    id: int
+    username: str
+    full_name: str
+
+
+class QuotationLineIn(BaseModel):
+    id: Optional[int] = None
+    product_id: Optional[int] = None
+    item_code: str = ""
+    description: str = Field(min_length=1, max_length=500)
+    hsn_code: str = ""
+    quantity: float = Field(gt=0)
+    uom: str = ""
+    price: float = Field(ge=0)
+    lead_time: str = ""
+    tax_percent: Optional[float] = None
+    amount: Optional[float] = 0
+
+
+class QuotationLineOut(ORMModel):
+    id: int
+    product_id: Optional[int]
+    product: Optional[ProductOut]
+    item_code: str
+    description: str
+    hsn_code: str
+    quantity: float
+    uom: str
+    price: float
+    lead_time: str
+    tax_percent: Optional[float]
+    amount: float
+
+
+class QuotationBase(BaseModel):
+    quotation_type: QuotationType
+    customer_id: Optional[int] = None
+    customer_name: str = ""
+    customer_contact: str = ""
+    customer_email: str = ""
+    customer_address: str = ""
+    customer_gstin: str = ""
+
+    company_name: str = "KALIKA ENTERPRISES"
+    company_address: str = "Plot No. M-59, MIDC, AHMEDNAGAR"
+    company_website: str = "www.kalikaindia.com"
+    company_phone: str = "+91 9405536016"
+    contact_email: str = "info@kalikaindia.com"
+
+    quotation_no: Optional[str] = None
+    quote_date: date = date.today()
+    valid_until: Optional[date] = None
+    approved_by: str = ""
+    terms: str = ""
+    payment_days: Optional[int] = Field(default=None, ge=1)
+    status: QuotationStatus = QuotationStatus.draft
+    lines: list[QuotationLineIn] = []
+
+
+class QuotationCreate(QuotationBase):
+    @field_validator("company_name")
+    @classmethod
+    def _valid_company_name(cls, v: str) -> str:
+        return normalize_quotation_company(v)
+
+
+class QuotationUpdate(QuotationBase):
+    @field_validator("company_name")
+    @classmethod
+    def _valid_company_name(cls, v: str) -> str:
+        return normalize_quotation_company(v)
+
+
+class QuotationOut(QuotationBase, ORMModel):
+    id: int
+    quotation_no: str
+    revision: int
+    revised_from_id: Optional[int]
+    subtotal: float
+    tax_total: float
+    total_amount: float
+    lines: list[QuotationLineOut]
+    customer: Optional[CustomerOut]
+    created_by: Optional[UserMiniOut]
+    created_at: datetime
+    updated_at: Optional[datetime]
+
+
+class QuotationListOut(ORMModel):
+    id: int
+    quotation_no: str
+    revision: int
+    quotation_type: QuotationType
+    status: QuotationStatus
+    customer_name: str
+    customer_id: Optional[int]
+    quote_date: date
+    valid_until: Optional[date]
+    total_amount: float
+    created_at: datetime
+
+
+class QuotationStatusIn(BaseModel):
+    status: QuotationStatus
+
+
+class QuotationDuplicateOut(QuotationOut):
+    pass
+
+
+class QuotationRevisionOut(ORMModel):
+    id: int
+    quotation_no: str
+    revision: int
+    status: QuotationStatus
+    quote_date: date
+    total_amount: float
+    created_at: datetime
+    created_by: Optional[UserMiniOut]
+
+
+class QuotationHistoryOut(ORMModel):
+    revisions: list[QuotationRevisionOut]
+    audit: list[Any]
+
+
+class TermsTemplateBase(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    content: str = ""
+    is_default: bool = False
+
+
+class TermsTemplateCreate(TermsTemplateBase):
+    pass
+
+
+class TermsTemplateUpdate(BaseModel):
+    name: Optional[str] = None
+    content: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
+class TermsTemplateOut(TermsTemplateBase, ORMModel):
+    id: int
+    created_at: datetime
+
+
+class QuotationEmailSendIn(BaseModel):
+    to: str
+    cc: Optional[str] = ""
+    subject: str
+    message: str
+    attach_pdf: bool = True
+
+
+class QuotationEmailPreviewOut(BaseModel):
+    to: str
+    cc: str
+    subject: str
+    message: str
+
+
+class QuotationEmailHistoryOut(ORMModel):
+    id: int
+    email_type: str
+    recipient: str
+    cc: str
+    subject: str
+    status: str
+    error_message: str
+    sent_at: datetime
+
+
+# ------------------------- PRN (Purchase Requisition Note) -------------------------
+class PRNLineIn(BaseModel):
+    """One material requirement row. Manual (unmatched) rows carry no stock —
+    the router stores NULL, never 0, for stock on a manual entry."""
+
+    id: Optional[int] = None
+    entry_mode: PRNLineMode = PRNLineMode.manual
+    material_id: Optional[int] = None
+    # Inventory location for the stock snapshot. None = Main Store (default).
+    plant_id: Optional[int] = None
+    material_code: str = Field(default="", max_length=120)
+    description: str = Field(default="", max_length=2000)
+    specification: str = Field(default="", max_length=2000)
+    quantity: float = 0
+    uom: str = Field(default="", max_length=30)
+    remarks: str = Field(default="", max_length=2000)
+    # Optional PRN-specific stock estimate (override). Never an inventory change.
+    stock_override: Optional[float] = None
+
+    @field_validator("stock_override")
+    @classmethod
+    def _override_non_negative(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and float(v) < 0:
+            raise ValueError("Stock override cannot be negative")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _description_required(cls, v: str) -> str:
+        if not (v or "").strip():
+            raise ValueError("Material description is required")
+        return v.strip()
+
+    @field_validator("quantity")
+    @classmethod
+    def _quantity_positive(cls, v: float) -> float:
+        if v is None or float(v) <= 0:
+            raise ValueError("Required quantity must be greater than zero")
+        return float(v)
+
+    @model_validator(mode="after")
+    def _existing_needs_material(self):
+        if self.entry_mode == PRNLineMode.existing and not self.material_id:
+            raise ValueError("An existing material selection is required for Existing mode")
+        return self
+
+
+class PRNCreate(BaseModel):
+    prn_date: Optional[date] = None
+    department: str = Field(default="", max_length=120)
+    department_head: str = Field(default="", max_length=160)
+    company_name: str = Field(default="", max_length=160)
+    # Manually entered requester name; falls back to the authenticated user.
+    requested_by_name: Optional[str] = Field(default=None, max_length=160)
+    required_by_date: Optional[date] = None
+    priority: str = Field(default="Normal", max_length=20)
+    requirement_type: str = Field(default="Production", max_length=40)
+    purpose: str = Field(default="", max_length=4000)
+    production_reference: str = Field(default="", max_length=120)
+    checked_by_name: str = Field(default="", max_length=160)
+    purchase_remarks: str = Field(default="", max_length=4000)
+    lines: list[PRNLineIn] = Field(default_factory=list)
+
+
+class PRNUpdate(BaseModel):
+    prn_date: Optional[date] = None
+    department: Optional[str] = Field(default=None, max_length=120)
+    department_head: Optional[str] = Field(default=None, max_length=160)
+    company_name: Optional[str] = Field(default=None, max_length=160)
+    requested_by_name: Optional[str] = Field(default=None, max_length=160)
+    required_by_date: Optional[date] = None
+    priority: Optional[str] = Field(default=None, max_length=20)
+    requirement_type: Optional[str] = Field(default=None, max_length=40)
+    purpose: Optional[str] = Field(default=None, max_length=4000)
+    production_reference: Optional[str] = Field(default=None, max_length=120)
+    checked_by_name: Optional[str] = Field(default=None, max_length=160)
+    purchase_remarks: Optional[str] = Field(default=None, max_length=4000)
+    lines: Optional[list[PRNLineIn]] = None
+
+
+class PRNRejectIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class PRNFulfillmentIn(BaseModel):
+    fulfillment_status: Literal["Pending", "Partially Fulfilled", "Completed"]
+    purchase_reference: str = Field(default="", max_length=120)
+    purchase_remarks: str = Field(default="", max_length=4000)

@@ -53,16 +53,27 @@ def update_user(user_id: int, body: UserUpdate, db: Annotated[Session, Depends(g
                 admin: AdminUser):
     user = get_or_404(db, User, user_id)
     data = body.model_dump(exclude_unset=True)
+    changes = {}
+    if data.get("email") is not None:
+        duplicate = db.scalar(select(User.id).where(
+            User.email == data["email"], User.id != user_id).limit(1))
+        if duplicate:
+            raise HTTPException(status.HTTP_409_CONFLICT, "Email already exists")
     if "password" in data and data["password"]:
         user.password_hash = hash_password(data.pop("password"))
+        changes["password"] = {"old": "********", "new": "********"}
     if "role" in data and admin.role != UserRole.admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Only admins can change roles")
     for k, v in data.items():
         if v is not None:
+            old = getattr(user, k)
+            if old != v:
+                changes[k] = {"old": old, "new": v}
             setattr(user, k, v)
     db.commit()
     db.refresh(user)
-    write_audit(db, admin, "UPDATE", "users", user.id, f"Updated user {user.username}")
+    write_audit(db, admin, "UPDATE", "users", user.id, f"Updated user {user.username}",
+                changes=changes)
     return user
 
 

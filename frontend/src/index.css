@@ -235,6 +235,10 @@ input[type='number'],
   border-bottom: 1px solid #e7e8eb;
   white-space: nowrap;
 }
+.data-table thead th.text-right,
+.data-table tbody td.text-right {
+  text-align: right;
+}
 .data-table tbody td {
   padding: 0.625rem 0.85rem;
   color: #334155;

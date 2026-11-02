@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from ..auth import create_access_token, get_current_user, hash_password, verify_password
+from ..config import settings
 from ..database import get_db
 from ..models import User
 from ..schemas import LoginRequest, TokenOut, UserOut
@@ -21,7 +22,27 @@ def login(body: LoginRequest, db: Annotated[Session, Depends(get_db)]):
     if not user.is_active:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Account is disabled")
     write_audit(db, user, "LOGIN", "auth", None, f"User {user.username} logged in")
-    return TokenOut(access_token=create_access_token(user), user=UserOut.model_validate(user))
+    return TokenOut(
+        access_token=create_access_token(user),
+        user=UserOut.model_validate(user),
+        expires_in=settings.JWT_EXPIRE_MINUTES * 60,
+        inactivity_seconds=settings.SESSION_INACTIVITY_MINUTES * 60,
+    )
+
+
+@router.post("/logout")
+def logout(
+    user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    """Explicit logout.
+
+    Access tokens are stateless JWTs, so the client discards its token; this
+    endpoint records the event for auditing and is the hook for any future
+    server-side token revocation. Only the caller's own session is ended.
+    """
+    write_audit(db, user, "LOGOUT", "auth", None, f"User {user.username} logged out")
+    return {"ok": True}
 
 
 @router.get("/me", response_model=UserOut)

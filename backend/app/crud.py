@@ -28,22 +28,41 @@ def paginate(
 
 
 def write_audit(db: Session, user: Optional[User], action: str, entity: str,
-                entity_id: Optional[int] = None, details: str = "", ip: str = "") -> None:
-    db.add(AuditLog(user_id=user.id if user else None, action=action, entity=entity,
-                    entity_id=entity_id, details=details[:4000], ip=ip))
+                entity_id: Optional[int] = None, details: str = "", ip: str = "",
+                changes: dict | None = None, created: int = 0,
+                updated: int = 0, failed: int = 0) -> None:
+    db.add(AuditLog(
+        user_id=user.id if user else None,
+        action=action,
+        entity=entity,
+        entity_id=entity_id,
+        details=details[:4000],
+        ip=ip,
+        changes=json.dumps(changes, cls=JSONEncoder) if changes else "",
+        created_count=created,
+        updated_count=updated,
+        failed_count=failed,
+    ))
     db.commit()
 
 
-def apply_updates(obj: Any, payload: BaseModel, exclude: set[str] | None = None) -> bool:
-    """Apply Pydantic fields onto a model instance, ignoring None values."""
-    changed = False
+def apply_updates(obj: Any, payload: BaseModel, exclude: set[str] | None = None) -> dict:
+    """Apply Pydantic fields onto a model instance, ignoring None values.
+
+    Returns the actual old/new field changes so callers can store them on the
+    audit trail. Non-mapped objects are fine; only real value changes count.
+    """
+    changes: dict[str, dict[str, Any]] = {}
     for key, value in payload.model_dump(exclude_unset=True).items():
         if exclude and key in exclude:
             continue
         if value is not None and hasattr(obj, key):
+            old = getattr(obj, key)
+            if old == value:
+                continue
+            changes[key] = {"old": old, "new": value}
             setattr(obj, key, value)
-            changed = True
-    return changed
+    return changes
 
 
 def get_or_404(db: Session, model, obj_id: int):

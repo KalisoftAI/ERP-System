@@ -47,10 +47,11 @@ def create_plant(body: PlantCreate, db: Annotated[Session, Depends(get_db)],
 def update_plant(plant_id: int, body: PlantUpdate, db: Annotated[Session, Depends(get_db)],
                  user: ManagerOrAdmin):
     p = get_or_404(db, Plant, plant_id)
-    apply_updates(p, body)
+    changes = apply_updates(p, body)
     db.commit()
     db.refresh(p)
-    write_audit(db, user, "UPDATE", "plants", p.id, f"Updated plant {p.name}")
+    write_audit(db, user, "UPDATE", "plants", p.id, f"Updated plant {p.name}",
+                changes=changes)
     return p
 
 

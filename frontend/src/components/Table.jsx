@@ -28,7 +28,12 @@ export default function Table({
             <tr
               key={row[keyField] ?? ri}
               onClick={onRowClick ? () => onRowClick(row) : undefined}
-              className={onRowClick ? 'cursor-pointer' : ''}
+              onKeyDown={onRowClick ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onRowClick(row) }
+              } : undefined}
+              tabIndex={onRowClick ? 0 : undefined}
+              role={onRowClick ? 'button' : undefined}
+              className={onRowClick ? 'cursor-pointer hover:bg-slate-50 transition-colors focus:outline-none focus:bg-slate-50' : ''}
             >
               {columns.map((c) => {
                 const sticky = stickyColumns.includes(c.key)

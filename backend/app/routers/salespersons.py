@@ -1,7 +1,7 @@
 """Salespeople master (read + list for dropdowns)."""
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -32,7 +32,8 @@ def list_salespersons(
 def create_salesperson(name: str, db: Annotated[Session, Depends(get_db)],
                        user: ManagerOrAdmin):
     if db.scalar(select(Salesperson).where(Salesperson.name == name)):
-        raise status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Salesperson already exists")
     s = Salesperson(name=name)
     db.add(s)
     db.commit()

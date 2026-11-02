@@ -5,6 +5,8 @@ import Layout from './components/Layout'
 import Dashboard from './pages/Dashboard'
 import RawMaterials from './pages/RawMaterials'
 import Purchases from './pages/Purchases'
+import PurchaseRequisitions from './pages/PurchaseRequisitions'
+import PrnDetail from './pages/PrnDetail'
 import Inventory from './pages/Inventory'
 import Production from './pages/Production'
 import Orders from './pages/Orders'
@@ -18,9 +20,13 @@ import Fulfilment from './pages/Fulfilment'
 import Alerts from './pages/Alerts'
 import Customers from './pages/Customers'
 import Suppliers from './pages/Suppliers'
+import Quotations from './pages/Quotations'
 import Reports from './pages/Reports'
 import Users from './pages/Users'
 import StockMovements from './pages/StockMovements'
+import PackagingList from './pages/PackagingList'
+import Employees from './pages/Employees'
+import ActivityLog from './pages/ActivityLog'
 
 function RequireAuth({ children }) {
   const { user } = useAuth()
@@ -45,6 +51,8 @@ function App() {
             <Route index element={<Dashboard />} />
             <Route path="raw-materials" element={<RawMaterials />} />
             <Route path="purchases" element={<Purchases />} />
+            <Route path="prn" element={<PurchaseRequisitions />} />
+            <Route path="prn/:id" element={<PrnDetail />} />
             <Route path="inventory" element={<Inventory />} />
             <Route path="stock-movements" element={<StockMovements />} />
             <Route path="production" element={<Production />} />
@@ -59,8 +67,12 @@ function App() {
             <Route path="local-orders" element={<LocalOrders />} />
             <Route path="customers" element={<Customers />} />
             <Route path="suppliers" element={<Suppliers />} />
+            <Route path="quotations" element={<Quotations />} />
+            <Route path="packaging-lists" element={<PackagingList />} />
+            <Route path="employees" element={<Employees />} />
             <Route path="reports" element={<Reports />} />
             <Route path="users" element={<Users />} />
+            <Route path="activity-log" element={<ActivityLog />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>

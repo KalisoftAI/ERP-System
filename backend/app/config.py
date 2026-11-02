@@ -25,15 +25,20 @@ class Settings(BaseSettings):
     CLOUD_SQL_DB_USER: str = "kalika_app"
     CLOUD_SQL_DB_PASS: str = ""
 
-    # ---- JWT ----
+    # ---- JWT / session ----
     JWT_SECRET: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
+    # Absolute session lifetime (a token can never be used past this age).
     JWT_EXPIRE_MINUTES: int = 480
+    # Inactivity window: the client signs the user out after this much idle
+    # time. Kept below JWT_EXPIRE_MINUTES so inactivity is the primary expiry.
+    SESSION_INACTIVITY_MINUTES: int = 30
     ACCESS_TOKEN_NAME: str = "kalika_access"
 
     # ---- GCS ----
     GCS_BUCKET: str = "kalisoftai-datahub"
     GCS_EXCEL_FILE: str = "Kalika_inventory/Daily Report Aug-26.xlsx"
+    GCS_STAMP_FILE: str = "Kalika_inventory/stamp.png"
     GOOGLE_APPLICATION_CREDENTIALS: str | None = None
     REPORT_DIR: Path = BASE_DIR / "reports"
 

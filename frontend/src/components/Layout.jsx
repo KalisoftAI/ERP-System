@@ -5,6 +5,7 @@ import {
   Truck, Users, Package, FileDown, ShieldCheck, LogOut, ListChecks,
   AlertTriangle, Store, BellRing, ClipboardList, GitBranch, LayoutGrid,
   ChevronsLeft, ChevronsRight, Menu, X, Layers, ArrowLeftRight, FileSpreadsheet, PackagePlus,
+  FileText, Briefcase, ClipboardCheck, History,
 } from 'lucide-react'
 import api from '../lib/api'
 import { useAuth } from '../context/AuthContext'
@@ -16,13 +17,20 @@ const SECTIONS = [
     items: [{ to: '/', label: 'Dashboard', icon: LayoutDashboard, end: true }],
   },
   {
-    label: 'Operations',
+    label: 'Sales',
     items: [
       { to: '/orders', label: 'Orders', icon: ShoppingBag },
+      { to: '/quotations', label: 'Quotations', icon: FileText },
+    ],
+  },
+  {
+    label: 'Operations',
+    items: [
       { to: '/dispatch', label: 'Dispatch', icon: Truck },
       { to: '/production', label: 'Production', icon: Factory },
       { to: '/local-orders', label: 'Local Orders', icon: Store },
       { to: '/pending-po', label: 'Pending PO', icon: ListChecks },
+      { to: '/packaging-lists', label: 'Packaging List', icon: Package },
     ],
   },
   {
@@ -37,6 +45,7 @@ const SECTIONS = [
     label: 'Procurement',
     items: [
       { to: '/purchases', label: 'Purchases', icon: ShoppingCart },
+      { to: '/prn', label: 'PRN', icon: ClipboardCheck },
       { to: '/requirements', label: 'Requirements', icon: AlertTriangle },
       { to: '/material-requirements', label: 'Material Req', icon: ClipboardList },
       { to: '/fulfilment', label: 'Fulfilment', icon: LayoutGrid },
@@ -57,11 +66,19 @@ const SECTIONS = [
       { to: '/suppliers', label: 'Suppliers', icon: Package },
     ],
   },
+  {
+    label: 'HR & Payroll Department',
+    items: [
+      { to: '/employees', label: 'Employee Management', icon: Briefcase },
+    ],
+  },
 ]
 
 const TITLE_MAP = {
   '/': { title: 'Dashboard', sub: 'Business overview' },
   '/orders': { title: 'Orders', sub: 'Sales orders & pipeline' },
+  '/quotations': { title: 'Quotations', sub: 'Sales quotations & proposals' },
+  '/packaging-lists': { title: 'Packaging List', sub: 'Box-wise packing weights' },
   '/dispatch': { title: 'Dispatch', sub: 'Customer-wise dispatch tracking' },
   '/production': { title: 'Production', sub: 'Schedule, actual output & reports' },
   '/local-orders': { title: 'Local Orders', sub: 'Local orders & plans' },
@@ -70,6 +87,7 @@ const TITLE_MAP = {
   '/inventory': { title: 'Inventory', sub: 'Stock levels & status' },
   '/stock-movements': { title: 'Stock Movements', sub: 'Every stock transaction' },
   '/purchases': { title: 'Purchases', sub: 'Purchase orders' },
+  '/prn': { title: 'Purchase Requisition Note', sub: 'Material purchase requirements' },
   '/requirements': { title: 'Requirements', sub: 'Requirement decisions' },
   '/material-requirements': { title: 'Material Requirements', sub: 'BOM-driven shortages' },
   '/fulfilment': { title: 'Fulfilment', sub: 'Stock → decision per line' },
@@ -77,8 +95,10 @@ const TITLE_MAP = {
   '/alerts': { title: 'Alert Center', sub: 'System notifications' },
   '/customers': { title: 'Customers', sub: 'Customer master' },
   '/suppliers': { title: 'Suppliers', sub: 'Supplier master' },
+  '/employees': { title: 'Employee Management', sub: 'HR & Payroll Department' },
   '/reports': { title: 'Reports', sub: 'Business summaries & exports' },
   '/users': { title: 'Users', sub: 'User administration' },
+  '/activity-log': { title: 'Activity Log', sub: 'Data change history & daily summary' },
 }
 
 export default function Layout() {
@@ -141,14 +161,21 @@ export default function Layout() {
           ))}
         </div>
       ))}
-      {user?.role === 'admin' && (
+      {(user?.role === 'admin' || user?.role === 'manager') && (
         <div className="mt-2">
           <div className={`sidebar-group-label ${collapsed ? 'sr-only' : ''}`}>Administration</div>
-          <NavLink to="/users" title={collapsed ? 'Users' : undefined}
+          <NavLink to="/activity-log" title={collapsed ? 'Activity Log' : undefined}
             className={({ isActive }) => `sidebar-link ${isActive ? 'active' : ''}`}>
-            <span className="icon-holder"><ShieldCheck size={17} /></span>
-            <span className={collapsed ? 'sr-only' : 'flex-1 text-left truncate'}>Users</span>
+            <span className="icon-holder"><History size={17} /></span>
+            <span className={collapsed ? 'sr-only' : 'flex-1 text-left truncate'}>Activity Log</span>
           </NavLink>
+          {user?.role === 'admin' && (
+            <NavLink to="/users" title={collapsed ? 'Users' : undefined}
+              className={({ isActive }) => `sidebar-link ${isActive ? 'active' : ''}`}>
+              <span className="icon-holder"><ShieldCheck size={17} /></span>
+              <span className={collapsed ? 'sr-only' : 'flex-1 text-left truncate'}>Users</span>
+            </NavLink>
+          )}
         </div>
       )}
     </nav>
@@ -163,19 +190,19 @@ export default function Layout() {
         }`}
       >
         {/* Brand */}
-        <div className={`flex items-center gap-3 px-4 py-5 border-b border-slate-800 ${collapsed ? 'justify-center px-2' : ''}`}>
+        <div className={`flex items-center gap-3 px-4 py-5 border-b border-slate-800 shrink-0 ${collapsed ? 'justify-center px-2' : ''}`}>
           {collapsed ? (
-            <div className="h-9 w-9 rounded-lg bg-white flex items-center justify-center shrink-0 shadow-md overflow-hidden">
-              <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-full w-full object-cover object-right" />
+            <div className="h-10 w-10 rounded-xl bg-white flex items-center justify-center shrink-0 shadow-lg p-1.5">
+              <img src="/Kalika_logo.png" alt="Kalika" className="max-h-full max-w-full object-contain" />
             </div>
           ) : (
             <>
-              <div className="h-10 rounded-xl bg-white flex items-center justify-center shrink-0 shadow-lg px-2">
-                <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-6 w-auto" />
+              <div className="h-[50px] w-[120px] rounded-[14px] bg-white flex items-center justify-center shrink-0 shadow-lg p-2">
+                <img src="/Kalika_logo.png" alt="Kalika" className="max-h-full max-w-full object-contain" />
               </div>
               <div className="min-w-0">
                 <div className="text-white font-bold text-[0.9375rem] leading-tight tracking-tight">Kalika ERP</div>
-                <div className="text-[0.625rem] text-slate-400 truncate">Enterprise Resource Mgmt</div>
+                <div className="text-[0.625rem] text-slate-400 truncate">Enterprise Resource Mg...</div>
               </div>
             </>
           )}
@@ -211,17 +238,17 @@ export default function Layout() {
         <div className="fixed inset-0 z-40 lg:hidden">
           <div className="absolute inset-0 bg-slate-900/60 backdrop-blur-sm" onClick={() => setMobileOpen(false)} />
           <aside className="absolute inset-y-0 left-0 w-72 bg-slate-900 text-slate-300 flex flex-col shadow-2xl animate-slide-in-right">
-            <div className="flex items-center justify-between px-4 py-5 border-b border-slate-800">
-              <div className="flex items-center gap-3">
-                <div className="h-10 rounded-xl bg-white flex items-center justify-center shrink-0 shadow-lg px-2">
-                  <img src="/kalika-logo.jpeg" alt="Kalika Enterprises" className="h-6 w-auto" />
+            <div className="flex items-center justify-between px-4 py-5 border-b border-slate-800 shrink-0">
+              <div className="flex items-center gap-3 min-w-0">
+                <div className="h-[50px] w-[120px] rounded-[14px] bg-white flex items-center justify-center shrink-0 shadow-lg p-2">
+                  <img src="/Kalika_logo.png" alt="Kalika" className="max-h-full max-w-full object-contain" />
                 </div>
-                <div>
+                <div className="min-w-0">
                   <div className="text-white font-bold text-[0.9375rem] leading-tight">Kalika ERP</div>
-                  <div className="text-[0.625rem] text-slate-400">Enterprise Resource Mgmt</div>
+                  <div className="text-[0.625rem] text-slate-400 truncate">Enterprise Resource Mg...</div>
                 </div>
               </div>
-              <button onClick={() => setMobileOpen(false)} className="text-slate-400 hover:text-white p-2" aria-label="Close menu">
+              <button onClick={() => setMobileOpen(false)} className="text-slate-400 hover:text-white p-2 shrink-0" aria-label="Close menu">
                 <X size={20} />
               </button>
             </div>
@@ -304,5 +331,5 @@ export default function Layout() {
         </main>
       </div>
     </div>
-  )
+)
 }

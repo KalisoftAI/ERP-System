@@ -27,6 +27,23 @@ def normalize_header(h: Any) -> str:
     return _HEADER_RE.sub("", str(h or "").strip().lower())
 
 
+def _sniff_sep(content: bytes) -> str:
+    """Choose a separator by comparing tab/comma/semicolon counts.
+
+    Many users save tab-separated data with a .csv extension, so we fall back
+    to the tab character when it clearly dominates commas.
+    """
+    text = content.decode("utf-8", errors="replace")
+    tabs = text.count("\t")
+    commas = text.count(",")
+    semicolons = text.count(";")
+    if tabs > commas and tabs > 0:
+        return "\t"
+    if semicolons > commas and semicolons > 0:
+        return ";"
+    return ","
+
+
 def read_table(filename: str, content: bytes) -> tuple[list[str], list[list[Any]]]:
     """Read a CSV or Excel upload into (headers, rows).
 
@@ -35,19 +52,22 @@ def read_table(filename: str, content: bytes) -> tuple[list[str], list[list[Any]
     - If multiple header-like rows are found, take the last one (users often
       put a title row then the column headers).
     - Preserve all data rows below the header.
+    - Tab-separated files saved as .csv are detected automatically.
     """
     name = (filename or "").lower()
     try:
         if name.endswith(".csv"):
-            df = pd.read_csv(BytesIO(content), dtype=object, keep_default_na=False)
+            sep = _sniff_sep(content)
+            df = pd.read_csv(BytesIO(content), dtype=object, keep_default_na=False, sep=sep)
         elif name.endswith((".xlsx", ".xls")):
             df = pd.read_excel(BytesIO(content), dtype=object, keep_default_na=False)
         else:
-            # Sniff: try Excel first (zip magic), then CSV.
+            # Sniff: try Excel first (zip magic), then CSV/TSV.
             if content[:2] == b"PK":
                 df = pd.read_excel(BytesIO(content), dtype=object, keep_default_na=False)
             else:
-                df = pd.read_csv(BytesIO(content), dtype=object, keep_default_na=False)
+                sep = _sniff_sep(content)
+                df = pd.read_csv(BytesIO(content), dtype=object, keep_default_na=False, sep=sep)
     except Exception as exc:  # noqa: BLE001 - surface a clean message to the user
         raise ValueError(f"Could not read file '{filename}': {exc}") from exc
 

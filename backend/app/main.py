@@ -16,7 +16,8 @@ from .routers import (
     auth, users, meta, customers, suppliers, products, plants, raw_materials,
     purchases, inventory, production, orders, dispatch, plans, dashboard, reports,
     requirements, salespersons, local_orders, bom, alerts,
-    material_requirements, fulfilment, stock_flow,
+    material_requirements, fulfilment, stock_flow, quotations, packaging_lists,
+    employees, prns, activity_log,
 )
 
 # Schema additions create_all cannot apply to pre-existing tables (idempotent ALTER).
@@ -37,6 +38,11 @@ _COLUMN_MIGRATIONS = [
     ("sales_orders", "local_order_type", "VARCHAR(20) DEFAULT 'TRADING'"),
     ("sales_orders", "so_no", "VARCHAR(120)"),
     ("purchase_orders", "supplier_name", "VARCHAR(255)"),
+    ("purchase_orders", "supplier_address", "TEXT DEFAULT ''"),
+    ("purchase_orders", "supplier_email", "VARCHAR(160) DEFAULT ''"),
+    ("purchase_orders", "po_type", "VARCHAR(20) DEFAULT 'regular'"),
+    ("purchase_orders", "valid_until", "DATE"),
+    ("purchase_order_lines", "make", "VARCHAR(120) DEFAULT ''"),
     ("purchase_order_lines", "item_code", "VARCHAR(120)"),
     ("stock_transfers", "customer_name", "VARCHAR(255)"),
     ("customer_dispatches", "customer_name", "VARCHAR(255)"),
@@ -45,6 +51,55 @@ _COLUMN_MIGRATIONS = [
     ("purchase_order_lines", "uom", "VARCHAR(30) DEFAULT ''"),
     ("purchase_order_lines", "tax_percent", "DOUBLE PRECISION"),
     ("purchase_order_lines", "discount_percent", "DOUBLE PRECISION"),
+    ("email_logs", "quotation_id", "INTEGER"),
+    ("email_logs", "cc", "VARCHAR(500) DEFAULT ''"),
+    ("production_orders", "sales_order_line_id", "INTEGER"),
+    ("packaging_lists", "less_default", "DOUBLE PRECISION DEFAULT 0"),
+    ("employees", "aadhaar_number", "VARCHAR(20) DEFAULT ''"),
+    ("employees", "pan_number", "VARCHAR(20) DEFAULT ''"),
+    ("employees", "bank_account_number", "VARCHAR(40) DEFAULT ''"),
+    ("employees", "ifsc_code", "VARCHAR(20) DEFAULT ''"),
+    ("employees", "bank_name", "VARCHAR(160) DEFAULT ''"),
+    ("employees", "branch_name", "VARCHAR(160) DEFAULT ''"),
+    ("employees", "pf_applicable", "VARCHAR(30) DEFAULT ''"),
+    ("employees", "uan", "VARCHAR(20) DEFAULT ''"),
+    ("employees", "pf_member_id", "VARCHAR(60) DEFAULT ''"),
+    ("employees", "pf_joining_date", "DATE"),
+    ("employees", "pf_exit_date", "DATE"),
+    ("employees", "previous_pf_membership", "VARCHAR(20) DEFAULT ''"),
+    ("employees", "esic_applicable", "VARCHAR(30) DEFAULT ''"),
+    ("employees", "esic_ip_number", "VARCHAR(30) DEFAULT ''"),
+    ("employees", "esic_joining_date", "DATE"),
+    ("employees", "esic_exit_date", "DATE"),
+    ("employees", "esic_registration_status", "VARCHAR(30) DEFAULT ''"),
+    ("employees", "verification_status", "VARCHAR(30) DEFAULT ''"),
+    ("employees", "verified_by", "VARCHAR(160) DEFAULT ''"),
+    ("employees", "verification_date", "DATE"),
+    ("employees", "remarks", "VARCHAR(500) DEFAULT ''"),
+    ("employees", "supporting_document_ref", "VARCHAR(255) DEFAULT ''"),
+    ("employees", "job_leave_date", "DATE"),
+    ("prns", "company_name", "VARCHAR(160) DEFAULT ''"),
+    ("prns", "department_head", "VARCHAR(160) DEFAULT ''"),
+    ("prns", "checked_by_name", "VARCHAR(160) DEFAULT ''"),
+    ("prns", "purchase_remarks", "TEXT DEFAULT ''"),
+    ("prn_lines", "stock_override", "DOUBLE PRECISION"),
+    ("prn_lines", "stock_overridden_by_name", "VARCHAR(160) DEFAULT ''"),
+    ("prn_lines", "stock_overridden_at", "TIMESTAMP"),
+    ("purchase_orders", "prn_id", "INTEGER"),
+    ("purchase_orders", "idempotency_key", "VARCHAR(80)"),
+    ("purchase_order_lines", "prn_line_id", "INTEGER"),
+    ("prn_lines", "plant_id", "INTEGER"),
+    ("prns", "prn_type", "VARCHAR(20) DEFAULT 'DIRECT'"),
+    ("prns", "issued_by_id", "INTEGER"),
+    ("prns", "issued_by_name", "VARCHAR(160) DEFAULT ''"),
+    ("prns", "issued_at", "TIMESTAMP"),
+    ("sales_orders", "transport_name", "VARCHAR(160) DEFAULT ''"),
+    ("quotations", "payment_days", "INTEGER"),
+    ("audit_logs", "changes", "TEXT DEFAULT ''"),
+    ("audit_logs", "created_count", "INTEGER DEFAULT 0"),
+    ("audit_logs", "updated_count", "INTEGER DEFAULT 0"),
+    ("audit_logs", "failed_count", "INTEGER DEFAULT 0"),
+    ("dispatch_lines", "schedule_qty", "DOUBLE PRECISION"),
 ]
 
 # Internal stock locations seeded as Plants (Main Store = plant_id NULL).
@@ -66,6 +121,49 @@ def _ensure_columns() -> None:
             "         THEN ROUND(CAST(COALESCE(inward_qty, 0) / COALESCE(schedule_qty, 0) AS NUMERIC), 4) ELSE 0 END "
             "WHERE schedule_qty IS NOT NULL AND balance_qty IS NULL"
         ))
+
+
+def _ensure_product_legacy_defaults() -> None:
+    """Give legacy products columns a default so ORM inserts can omit them.
+
+    Some deployed databases carry extra NOT NULL columns (barcode, qr_data, …)
+    that the current Product model does not map. Without a default, creating a
+    product lazily (e.g. receiving an unmatched PO line) fails on INSERT.
+    Only existing columns are touched; fresh databases are unaffected.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        existing = {row[0] for row in conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'products'"
+        ))}
+        for column in ("barcode", "barcode_format", "qr_data", "weight_uom", "hsn_code"):
+            if column in existing:
+                conn.execute(text(
+                    f"ALTER TABLE products ALTER COLUMN {column} SET DEFAULT ''"
+                ))
+
+
+def _ensure_prn_po_indexes() -> None:
+    """Additive indexes for the PRN↔PO link (idempotent).
+
+    The idempotency-key unique index is PARTIAL (WHERE NOT NULL) so the many
+    NULL keys of normal POs never collide. Postgres-only; SQLite (tests) builds
+    no index beyond the model's plain ones.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_purchase_orders_prn_id "
+            "ON purchase_orders (prn_id)"))
+        conn.execute(text(
+            "CREATE INDEX IF NOT EXISTS ix_purchase_order_lines_prn_line_id "
+            "ON purchase_order_lines (prn_line_id)"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_purchase_orders_idempotency_key "
+            "ON purchase_orders (idempotency_key) WHERE idempotency_key IS NOT NULL"))
 
 
 def _ensure_order_status_enum() -> None:
@@ -101,6 +199,33 @@ def _ensure_order_status_enum() -> None:
         conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'partially_dispatched\''))
         conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'ready_for_dispatch\''))
         conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'purchase_required\''))
+
+
+def _ensure_email_type_enum() -> None:
+    """Add the Quotation value to the email_logs.email_type enum.
+
+    create_all cannot alter an existing Postgres enum, so add the value
+    idempotently (additive; no data touched). No-op on non-Postgres engines.
+    """
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        type_name = conn.execute(text(
+            "SELECT t.typname FROM pg_attribute a "
+            "JOIN pg_class c ON c.oid = a.attrelid "
+            "JOIN pg_type t ON t.oid = a.atttypid "
+            "WHERE c.relname = 'email_logs' AND a.attname = 'email_type'"
+        )).scalar()
+        if not type_name:
+            return
+        present = conn.execute(text(
+            "SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
+            "WHERE t.typname = :t AND e.enumlabel = :v"
+        ), {"t": type_name, "v": "quotation"}).scalar()
+    if present:
+        return
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+        conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE \'quotation\''))
 
 
 def _ensure_number_indexes() -> None:
@@ -196,6 +321,82 @@ def _ensure_locations() -> None:
             log.info("Seeded internal locations: %s", _LOCATION_PLANTS)
 
 
+def _backfill_dispatch_line_schedules() -> None:
+    """Derive product-wise schedule_qty for existing dispatch lines (idempotent).
+
+    Mapping rules (reliable only):
+      - line.sales_order_line_id -> that order line's schedule (schedule_qty ?? quantity)
+      - else order-linked dispatch + product match -> sum of matching order lines' schedule
+    Unmappable lines (manual, no order) keep NULL — preserved for review.
+
+    Order-linked dispatches whose lines are ALL mapped get their header
+    schedule/completion/balance/status recomputed from the line schedules.
+    Manual dispatches and partially-mapped dispatches are left untouched.
+    """
+    from .database import SessionLocal
+    from .models import Dispatch, DispatchLine, SalesOrderLine, DispatchStatus
+    from .services.dispatch_calc import order_line_schedule
+
+    stats = {"mapped": 0, "unmapped": 0, "headers_recomputed": 0, "total_null": 0}
+    with SessionLocal() as db:
+        lines = db.scalars(select(DispatchLine).where(DispatchLine.schedule_qty.is_(None))).all()
+        if not lines:
+            log.info("DispatchLine.schedule_qty backfill: no NULL rows")
+            return
+        stats["total_null"] = len(lines)
+        for ln in lines:
+            sched = None
+            if ln.sales_order_line_id:
+                sol = db.get(SalesOrderLine, ln.sales_order_line_id)
+                if sol is not None:
+                    sched = order_line_schedule(sol)
+            if sched is None:
+                d = db.get(Dispatch, ln.dispatch_id)
+                if d and d.sales_order_id and ln.product_id:
+                    sols = db.scalars(
+                        select(SalesOrderLine).where(
+                            SalesOrderLine.order_id == d.sales_order_id,
+                            SalesOrderLine.product_id == ln.product_id,
+                        ).order_by(SalesOrderLine.id)
+                    ).all()
+                    if sols:
+                        sched = sum((order_line_schedule(s) or 0.0) for s in sols)
+            if sched is None or sched <= 0:
+                # Truly unmappable/manual lines: leave NULL for manual review
+                stats["unmapped"] += 1
+                continue
+            ln.schedule_qty = float(sched)
+            stats["mapped"] += 1
+        db.flush()
+        # Recompute headers only for order-linked dispatches with every line mapped
+        d_ids = {ln.dispatch_id for ln in lines}
+        for did in d_ids:
+            d = db.get(Dispatch, did)
+            if d is None or not d.sales_order_id:
+                continue
+            if not d.lines:
+                continue
+            if not all((getattr(l, "schedule_qty", None) is not None) for l in d.lines):
+                continue
+            d.schedule_qty = float(sum(float(l.schedule_qty or 0) for l in d.lines))
+            d.dispatched_qty = float(sum(float(l.quantity or 0) for l in d.lines))
+            if d.schedule_qty:
+                d.completion_pct = round(d.dispatched_qty / d.schedule_qty, 4)
+                d.balance_qty = d.schedule_qty - d.dispatched_qty
+            else:
+                d.completion_pct = 0.0
+                d.balance_qty = 0.0
+            if d.schedule_qty > 0 and d.dispatched_qty >= d.schedule_qty - 1e-9:
+                d.status = DispatchStatus.completed
+            elif d.dispatched_qty > 0:
+                d.status = DispatchStatus.partial
+            else:
+                d.status = DispatchStatus.pending
+            stats["headers_recomputed"] += 1
+        db.commit()
+    log.warning("DispatchLine.schedule_qty backfill: %s", stats)
+
+
 log = logging.getLogger("kalika")
 
 app = FastAPI(
@@ -219,6 +420,10 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     log.info("Kalika ERP v%s starting …", settings.APP_VERSION)
+    if _FRONTEND_DIST is not None:
+        log.info("Frontend dist resolved to: %s", _FRONTEND_DIST)
+    else:
+        log.warning("Frontend dist not found; SPA refresh may not work.")
     try:
         host = settings.database_url.split("@")[-1].split("?")[0] if "@" in settings.database_url else "local"
         log.info("Database target: %s", host)
@@ -238,11 +443,26 @@ def on_startup():
         log.info("Column migrations applied.")
     except Exception as exc:
         log.error("column migration failed (recoverable): %s", exc)
+    # Legacy NOT NULL product columns must have defaults for lazy product creation.
+    try:
+        _ensure_product_legacy_defaults()
+    except Exception as exc:
+        log.error("product legacy default migration failed (recoverable): %s", exc)
+    # Additive indexes + idempotency unique index for the PRN↔PO link.
+    try:
+        _ensure_prn_po_indexes()
+    except Exception as exc:
+        log.error("PRN/PO index migration failed (recoverable): %s", exc)
     # Manual 'Production Completed' Local Order status (existing Postgres enum).
     try:
         _ensure_order_status_enum()
     except Exception as exc:
         log.error("order-status enum migration failed (recoverable): %s", exc)
+    # Add Quotation email type to the EmailType enum (existing Postgres enum).
+    try:
+        _ensure_email_type_enum()
+    except Exception as exc:
+        log.error("email-type enum migration failed (recoverable): %s", exc)
     # SO/PO numbers became manual business references; drop the legacy UNIQUE
     # indexes on them (idempotent, data untouched). Recreated as plain indexes.
     try:
@@ -253,8 +473,15 @@ def on_startup():
     # Internal stock locations (Dispatch, Production) — idempotent seed.
     try:
         _ensure_locations()
+        log.info("Internal locations ensured.")
     except Exception as exc:
         log.error("location seed failed (recoverable): %s", exc)
+    # Product-wise dispatch schedules (DispatchLine.schedule_qty) — backfill
+    # existing rows idempotently; never drop/truncate/reset data.
+    try:
+        _backfill_dispatch_line_schedules()
+    except Exception as exc:
+        log.error("dispatch line schedule backfill failed (recoverable): %s", exc)
     # C3: one inventory row per (product_id, plant_id) incl. Main Store (NULL
     # plant) — duplicate PRE-CHECKED; additive + idempotent, no data touched.
     try:
@@ -312,6 +539,7 @@ app.include_router(reports.router)
 app.include_router(requirements.router)
 app.include_router(salespersons.router)
 app.include_router(local_orders.router)
+app.include_router(quotations.router)
 app.include_router(bom.router)
 app.include_router(alerts.router)
 app.include_router(material_requirements.router)
@@ -319,13 +547,34 @@ app.include_router(fulfilment.router)
 app.include_router(stock_flow.locations_router)
 app.include_router(stock_flow.transfer_router)
 app.include_router(stock_flow.dispatch_router)
+app.include_router(packaging_lists.router)
+app.include_router(employees.router)
+app.include_router(prns.router)
+app.include_router(activity_log.router)
 
 
 # Serve the built React app in production mode (frontend/dist mounted next to backend).
-_FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+def _resolve_frontend_dist() -> Path | None:
+    """Locate the built frontend dist folder. Tries several common layouts so
+    SPA refresh works regardless of how the container is started."""
+    candidates = [
+        Path(__file__).resolve().parent.parent / "frontend" / "dist",
+        Path.cwd() / "frontend" / "dist",
+        Path("/app") / "frontend" / "dist",
+        Path("/workspace") / "frontend" / "dist",
+    ]
+    for p in candidates:
+        if (p / "index.html").is_file():
+            return p
+    return None
+
+
+_FRONTEND_DIST = _resolve_frontend_dist()
 
 
 def _serve_frontend(path: str):
+    if _FRONTEND_DIST is None:
+        return RedirectResponse(url="/docs")
     index = _FRONTEND_DIST / "index.html"
     if not index.exists():
         return RedirectResponse(url="/docs")
@@ -343,24 +592,57 @@ async def spa_html_navigation(request: Request, call_next):
     before the SPA catch-all, so a hard refresh on a page URL would otherwise
     hit an authenticated API route and return 401 {"detail":"Not authenticated"}.
     Browser navigations send Accept: text/html; API calls from the SPA send
-    Accept: application/json, so this only affects genuine page loads.
+    Accept: application/json. To stay robust against any Accept-header quirks,
+    we let the request reach the router first and only serve index.html when the
+    router responds with 401 or 404.
     """
     accept = request.headers.get("accept", "")
     path = request.url.path
     if (
         request.method == "GET"
-        and "text/html" in accept
-        and _FRONTEND_DIST.exists()
+        and _FRONTEND_DIST is not None
         and path not in ("/", "/health", "/docs", "/redoc", "/openapi.json")
         and not path.startswith("/assets/")
     ):
-        index = _FRONTEND_DIST / "index.html"
-        if index.exists():
-            return FileResponse(index)
+        response = await call_next(request)
+        content_type = response.headers.get("content-type", "")
+        # Browser navigations ask for HTML. If the router treated the URL as an
+        # authenticated API call and returned 401/404/JSON, serve the SPA instead.
+        if response.status_code in (401, 404):
+            index = _FRONTEND_DIST / "index.html"
+            if index.exists():
+                log.info("SPA fallback for %s (status %s)", path, response.status_code)
+                return FileResponse(index)
+        if "text/html" in accept and "application/json" in content_type:
+            index = _FRONTEND_DIST / "index.html"
+            if index.exists():
+                log.info("SPA fallback for %s (JSON response to HTML request)", path)
+                return FileResponse(index)
+        return response
     return await call_next(request)
 
 
-if _FRONTEND_DIST.exists():
+@app.middleware("http")
+async def cache_control_headers(request: Request, call_next):
+    """Prevent browsers from caching API responses as if they were HTML.
+
+    SPA routes and API routes share the same origin and often the same URL
+    prefix (e.g. /quotations). Without explicit cache headers, an old HTML
+    fallback response can be served from the browser cache for a later JSON
+    API call, causing `.filter is not a function` runtime errors. Static
+    assets are excluded so JS/CSS files remain cacheable.
+    """
+    response = await call_next(request)
+    path = request.url.path
+    if not path.startswith("/assets/"):
+        response.headers["Cache-Control"] = (
+            "no-store, no-cache, must-revalidate, max-age=0"
+        )
+        response.headers["Pragma"] = "no-cache"
+    return response
+
+
+if _FRONTEND_DIST is not None:
     app.mount("/assets", StaticFiles(directory=_FRONTEND_DIST / "assets"), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)

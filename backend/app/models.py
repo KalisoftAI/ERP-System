@@ -10,7 +10,7 @@ from datetime import date, datetime
 
 from sqlalchemy import (
     BigInteger, Boolean, Date, DateTime, Enum, Float, ForeignKey, Index,
-    Integer, Numeric, String, Text, UniqueConstraint,
+    Integer, Numeric, String, Text, UniqueConstraint, event,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -56,6 +56,7 @@ class OrderStatus(str, enum.Enum):
     new = "New"
     confirmed = "Confirmed"
     in_production = "In Production"
+    production_in_process = "Production In Process"
     production_completed = "Production Completed"
     ready = "Ready"
     dispatched = "Dispatched"
@@ -87,6 +88,19 @@ class PurchaseStatus(str, enum.Enum):
     partially_received = "Partially Received"
     received = "Received"
     cancelled = "Cancelled"
+
+
+class QuotationStatus(str, enum.Enum):
+    draft = "Draft"
+    sent = "Sent"
+    accepted = "Accepted"
+    rejected = "Rejected"
+    expired = "Expired"
+
+
+class QuotationType(str, enum.Enum):
+    manufacturing = "Manufacturing"
+    trading = "Trading"
 
 
 class MovementType(str, enum.Enum):
@@ -285,6 +299,55 @@ class Plant(Base):
     customer: Mapped[Customer | None] = relationship()
 
 
+class EmployeeStatus(str, enum.Enum):
+    active = "Active"
+    inactive = "Inactive"
+
+
+class Employee(Base):
+    """HR employee master (HR & Payroll Department / Employee Management)."""
+
+    __tablename__ = "employees"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    employee_code: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(160), index=True)
+    mobile: Mapped[str] = mapped_column(String(30), default="")
+    email: Mapped[str] = mapped_column(String(160), default="")
+    department: Mapped[str] = mapped_column(String(120), default="", index=True)
+    designation: Mapped[str] = mapped_column(String(120), default="", index=True)
+    joining_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # Personal identification & bank details (sensitive, admin-only access).
+    aadhaar_number: Mapped[str] = mapped_column(String(20), default="")
+    pan_number: Mapped[str] = mapped_column(String(20), default="")
+    bank_account_number: Mapped[str] = mapped_column(String(40), default="")
+    ifsc_code: Mapped[str] = mapped_column(String(20), default="")
+    bank_name: Mapped[str] = mapped_column(String(160), default="")
+    branch_name: Mapped[str] = mapped_column(String(160), default="")
+    # Statutory / payroll details (Advanced Edit). All optional and additive.
+    pf_applicable: Mapped[str] = mapped_column(String(30), default="")
+    uan: Mapped[str] = mapped_column(String(20), default="")
+    pf_member_id: Mapped[str] = mapped_column(String(60), default="")
+    pf_joining_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    pf_exit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    previous_pf_membership: Mapped[str] = mapped_column(String(20), default="")
+    esic_applicable: Mapped[str] = mapped_column(String(30), default="")
+    esic_ip_number: Mapped[str] = mapped_column(String(30), default="")
+    esic_joining_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    esic_exit_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    esic_registration_status: Mapped[str] = mapped_column(String(30), default="")
+    verification_status: Mapped[str] = mapped_column(String(30), default="")
+    verified_by: Mapped[str] = mapped_column(String(160), default="")
+    verification_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    remarks: Mapped[str] = mapped_column(String(500), default="")
+    supporting_document_ref: Mapped[str] = mapped_column(String(255), default="")
+    job_leave_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    status: Mapped[EmployeeStatus] = mapped_column(
+        Enum(EmployeeStatus), default=EmployeeStatus.active, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 # ---------------------------------------------------------------------------
 # Raw material & purchase
 # ---------------------------------------------------------------------------
@@ -318,14 +381,28 @@ class PurchaseOrder(Base):
     po_number: Mapped[str] = mapped_column(String(120), index=True)
     supplier_id: Mapped[int | None] = mapped_column(ForeignKey("suppliers.id"), nullable=True, index=True)
     supplier_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    # Snapshot of manually entered Import PO supplier details. Import POs may
+    # use suppliers that do not exist in the master, so these stay on the PO
+    # and never create/update a Supplier record.
+    supplier_address: Mapped[str] = mapped_column(Text, default="")
+    supplier_email: Mapped[str] = mapped_column(String(160), default="")
     order_date: Mapped[date] = mapped_column(Date, index=True, default=date.today)
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
     status: Mapped[PurchaseStatus] = mapped_column(
         Enum(PurchaseStatus), default=PurchaseStatus.ordered, index=True
     )
     total_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
     notes: Mapped[str] = mapped_column(Text, default="")
     source_excel: Mapped[str] = mapped_column(String(255), default="")
+    po_type: Mapped[str] = mapped_column(String(20), default="regular")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Link to the PRN this PO fulfils (nullable; one PRN may map to several POs).
+    # Plain integer reference (no FK) so the column is purely additive on
+    # existing databases; the PRN remains authoritative for its own lifecycle.
+    prn_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Client-supplied dedupe token: a replayed create request returns the PO
+    # created by the first attempt instead of inserting a duplicate.
+    idempotency_key: Mapped[str | None] = mapped_column(String(80), nullable=True)
 
     lines: Mapped[list[PurchaseOrderLine]] = relationship(back_populates="po", cascade="all, delete-orphan")
     supplier: Mapped[Supplier | None] = relationship()
@@ -339,6 +416,7 @@ class PurchaseOrderLine(Base):
     product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     item_code: Mapped[str] = mapped_column(String(120), default="", index=True)
+    make: Mapped[str] = mapped_column(String(120), default="")
     quantity: Mapped[float] = mapped_column(Float, default=0)
     received_qty: Mapped[float] = mapped_column(Float, default=0)
     rate: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
@@ -346,6 +424,8 @@ class PurchaseOrderLine(Base):
     uom: Mapped[str] = mapped_column(String(30), default="")
     tax_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     discount_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # The PRN line this PO line fulfils (nullable; additive, no FK).
+    prn_line_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
 
     po: Mapped[PurchaseOrder] = relationship(back_populates="lines")
     product: Mapped[Product | None] = relationship()
@@ -480,6 +560,46 @@ class CustomerDispatchLine(Base):
 
 
 # ---------------------------------------------------------------------------
+# Packaging List
+# ---------------------------------------------------------------------------
+class PackagingList(Base):
+    __tablename__ = "packaging_lists"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    list_no: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    list_date: Mapped[date] = mapped_column(Date, index=True, default=date.today)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
+    customer_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    item_description: Mapped[str] = mapped_column(Text, default="")
+    less_default: Mapped[float] = mapped_column(Float, default=0)
+    total_gross_wt: Mapped[float] = mapped_column(Float, default=0)
+    total_less: Mapped[float] = mapped_column(Float, default=0)
+    total_net_wt: Mapped[float] = mapped_column(Float, default=0)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer: Mapped[Customer | None] = relationship()
+    created_by: Mapped["User | None"] = relationship("User")
+    lines: Mapped[list["PackagingListLine"]] = relationship(
+        back_populates="packaging_list", cascade="all, delete-orphan"
+    )
+
+
+class PackagingListLine(Base):
+    __tablename__ = "packaging_list_lines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    packaging_list_id: Mapped[int] = mapped_column(ForeignKey("packaging_lists.id"), index=True)
+    sr_no: Mapped[int] = mapped_column(Integer, default=0)
+    gross_wt: Mapped[float] = mapped_column(Float, default=0)
+    less: Mapped[float] = mapped_column(Float, default=0)
+    net_wt: Mapped[float] = mapped_column(Float, default=0)
+
+    packaging_list: Mapped[PackagingList] = relationship(back_populates="lines")
+
+
+# ---------------------------------------------------------------------------
 # Production
 # ---------------------------------------------------------------------------
 class ProductionOrder(Base):
@@ -491,6 +611,7 @@ class ProductionOrder(Base):
     customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
     salesperson_id: Mapped[int | None] = mapped_column(ForeignKey("salespersons.id"), nullable=True)
     sales_order_id: Mapped[int | None] = mapped_column(ForeignKey("sales_orders.id"), nullable=True, index=True)
+    sales_order_line_id: Mapped[int | None] = mapped_column(ForeignKey("sales_order_lines.id"), nullable=True, index=True)
     section: Mapped[str] = mapped_column(String(120), default="", index=True)
     schedule_qty: Mapped[float] = mapped_column(Float, default=0)
     ask_till_date: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -516,6 +637,7 @@ class ProductionOrder(Base):
     customer: Mapped[Customer | None] = relationship()
     salesperson: Mapped[Salesperson | None] = relationship()
     sales_order: Mapped[SalesOrder | None] = relationship()
+    sales_order_line: Mapped["SalesOrderLine | None"] = relationship("SalesOrderLine")
     movements: Mapped[list[ProductionMovement]] = relationship(
         back_populates="production_order", cascade="all, delete-orphan"
     )
@@ -558,6 +680,7 @@ class SalesOrder(Base):
     status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), default=OrderStatus.new, index=True)
     total_value: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
     remarks: Mapped[str] = mapped_column(Text, default="")
+    transport_name: Mapped[str] = mapped_column(String(160), default="")
     source_excel: Mapped[str] = mapped_column(String(255), default="")
     source_sheet: Mapped[str] = mapped_column(String(120), default="")
     source_row: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -646,6 +769,10 @@ class DispatchLine(Base):
     sales_order_line_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     quantity: Mapped[float] = mapped_column(Float, default=0)
+    # Product-wise scheduled quantity for THIS line, derived from the linked
+    # order line (SalesOrderLine.schedule_qty ?? quantity) at write time. NULL on
+    # legacy rows that cannot be mapped reliably — preserved for manual review.
+    schedule_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
     dispatch_date: Mapped[date] = mapped_column(Date, index=True)
     rate: Mapped[float | None] = mapped_column(Numeric(14, 2), nullable=True)
     weight: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -815,14 +942,23 @@ class Alert(Base):
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     action: Mapped[str] = mapped_column(String(60), index=True)
     entity: Mapped[str] = mapped_column(String(120), index=True)
     entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     details: Mapped[str] = mapped_column(Text, default="")
     ip: Mapped[str] = mapped_column(String(60), default="")
+    changes: Mapped[str] = mapped_column(Text, default="")
+    created_count: Mapped[int] = mapped_column(Integer, default=0)
+    updated_count: Mapped[int] = mapped_column(Integer, default=0)
+    failed_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+@event.listens_for(AuditLog, "before_update")
+def _audit_log_immutable(mapper, connection, target):
+    raise ValueError("Audit log rows are immutable")
 
 
 class MigrationLog(Base):
@@ -841,6 +977,7 @@ class MigrationLog(Base):
 class EmailType(str, enum.Enum):
     order_confirmation = "Order Confirmation"
     dispatch_email = "Dispatch Email"
+    quotation = "Quotation"
 
 
 class EmailLog(Base):
@@ -849,7 +986,9 @@ class EmailLog(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     sales_order_id: Mapped[int | None] = mapped_column(ForeignKey("sales_orders.id"), nullable=True, index=True)
     dispatch_id: Mapped[int | None] = mapped_column(ForeignKey("dispatches.id"), nullable=True, index=True)
+    quotation_id: Mapped[int | None] = mapped_column(ForeignKey("quotations.id"), nullable=True, index=True)
     email_type: Mapped[EmailType] = mapped_column(Enum(EmailType), index=True)
+    cc: Mapped[str] = mapped_column(String(500), default="")
     recipient: Mapped[str] = mapped_column(String(160), index=True)
     subject: Mapped[str] = mapped_column(String(255), default="")
     status: Mapped[str] = mapped_column(String(40), index=True, default="pending")  # sent / failed
@@ -858,3 +997,233 @@ class EmailLog(Base):
 
     sales_order: Mapped[SalesOrder | None] = relationship()
     dispatch: Mapped[Dispatch | None] = relationship()
+    quotation: Mapped[Quotation | None] = relationship()
+
+
+class TermsTemplate(Base):
+    """Reusable Terms & Conditions content for quotations."""
+
+    __tablename__ = "terms_templates"
+    __table_args__ = (UniqueConstraint("name", name="uq_terms_template_name"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+# Company identities a quotation can be issued under. The quotation form only
+# offers these values, and the API rejects anything else.
+QUOTATION_COMPANY_NAMES: tuple[str, ...] = ("KALIKA ENTERPRISES", "KALIKA INFOTECH")
+
+
+def normalize_quotation_company(value: str | None) -> str:
+    """Return the canonical company name for a case-insensitive match.
+
+    Raises ValueError for unsupported values so callers (e.g. the API schemas)
+    can reject them.
+    """
+    candidate = (value or "").strip()
+    for name in QUOTATION_COMPANY_NAMES:
+        if candidate.upper() == name.upper():
+            return name
+    raise ValueError(
+        "Company name must be one of: " + ", ".join(QUOTATION_COMPANY_NAMES)
+    )
+
+
+class Quotation(Base):
+    """Customer quotation (commercial pre-order document)."""
+
+    __tablename__ = "quotations"
+    __table_args__ = (
+        UniqueConstraint("quotation_no", "revision", name="uq_quotation_no_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    quotation_no: Mapped[str] = mapped_column(String(120), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    revised_from_id: Mapped[int | None] = mapped_column(ForeignKey("quotations.id"), nullable=True, index=True)
+    quotation_type: Mapped[QuotationType] = mapped_column(Enum(QuotationType), index=True)
+    status: Mapped[QuotationStatus] = mapped_column(
+        Enum(QuotationStatus), default=QuotationStatus.draft, index=True
+    )
+
+    # Customer information (denormalised copies for historical stability)
+    customer_id: Mapped[int | None] = mapped_column(ForeignKey("customers.id"), nullable=True, index=True)
+    customer_name: Mapped[str] = mapped_column(String(255), default="", index=True)
+    customer_contact: Mapped[str] = mapped_column(String(60), default="")
+    customer_email: Mapped[str] = mapped_column(String(160), default="")
+    customer_address: Mapped[str] = mapped_column(Text, default="")
+    customer_gstin: Mapped[str] = mapped_column(String(40), default="")
+
+    # Company information shown on the quotation document
+    company_name: Mapped[str] = mapped_column(String(255), default="KALIKA ENTERPRISES")
+    company_address: Mapped[str] = mapped_column(Text, default="")
+    company_website: Mapped[str] = mapped_column(String(255), default="")
+    company_phone: Mapped[str] = mapped_column(String(60), default="")
+    contact_email: Mapped[str] = mapped_column(String(160), default="")
+
+    # Quotation metadata
+    quote_date: Mapped[date] = mapped_column(Date, index=True, default=date.today)
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+    approved_by: Mapped[str] = mapped_column(String(160), default="")
+    terms: Mapped[str] = mapped_column(Text, default="")
+    payment_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Financial totals (stored to guarantee consistency across views/PDF/email)
+    subtotal: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    discount_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    tax_total: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    total_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, onupdate=datetime.utcnow)
+
+    customer: Mapped[Customer | None] = relationship()
+    created_by: Mapped[User | None] = relationship()
+    lines: Mapped[list[QuotationLine]] = relationship(
+        back_populates="quotation", cascade="all, delete-orphan", order_by="QuotationLine.id"
+    )
+    revised_from: Mapped[Quotation | None] = relationship(
+        remote_side="Quotation.id", back_populates="revisions"
+    )
+    revisions: Mapped[list[Quotation]] = relationship(
+        back_populates="revised_from", order_by="Quotation.revision"
+    )
+
+
+class QuotationLine(Base):
+    """One line item on a customer quotation."""
+
+    __tablename__ = "quotation_lines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    quotation_id: Mapped[int] = mapped_column(ForeignKey("quotations.id"), index=True)
+    product_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
+
+    item_code: Mapped[str] = mapped_column(String(120), default="")
+    description: Mapped[str] = mapped_column(String(500), default="")
+    hsn_code: Mapped[str] = mapped_column(String(60), default="")
+    quantity: Mapped[float] = mapped_column(Numeric(14, 3), default=0)
+    uom: Mapped[str] = mapped_column(String(30), default="")
+    price: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    lead_time: Mapped[str] = mapped_column(String(120), default="")
+
+    discount_percent: Mapped[float | None] = mapped_column(Float, default=0)
+    tax_percent: Mapped[float | None] = mapped_column(Float, default=0)
+
+    # Stored line totals for consistency
+    basic_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    discount_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    tax_amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+    amount: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+
+    quotation: Mapped[Quotation] = relationship(back_populates="lines")
+    product: Mapped[Product | None] = relationship()
+
+
+# ---------------------------------------------------------------------------
+# PRN — Purchase Requisition Note (additive, isolated)
+# ---------------------------------------------------------------------------
+class PRNStatus(str, enum.Enum):
+    draft = "Draft"
+    pending_approval = "Pending Approval"
+    approved = "Approved"
+    rejected = "Rejected"
+    sent_to_purchase = "Sent to Purchase"
+    partially_fulfilled = "Partially Fulfilled"
+    completed = "Completed"
+    cancelled = "Cancelled"
+
+
+class PRNLineMode(str, enum.Enum):
+    existing = "EXISTING"
+    manual = "MANUAL"
+
+
+class PRN(Base):
+    """Purchase Requisition Note header. A PRN is a request document only — it
+    never creates purchase orders, goods receipts or stock movements on its own.
+    Stock fields on the lines are a point-in-time snapshot for the requester."""
+
+    __tablename__ = "prns"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    prn_number: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    prn_date: Mapped[date] = mapped_column(Date, default=date.today, index=True)
+    department: Mapped[str] = mapped_column(String(120), default="", index=True)
+    requested_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
+    requested_by_name: Mapped[str] = mapped_column(String(160), default="")
+    required_by_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    priority: Mapped[str] = mapped_column(String(20), default="Normal", index=True)
+    requirement_type: Mapped[str] = mapped_column(String(40), default="Production", index=True)
+    purpose: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[PRNStatus] = mapped_column(
+        Enum(PRNStatus), default=PRNStatus.draft, index=True
+    )
+    fulfillment_status: Mapped[str] = mapped_column(String(30), default="Pending", index=True)
+    rejection_reason: Mapped[str] = mapped_column(Text, default="")
+    approved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    approved_by_name: Mapped[str] = mapped_column(String(160), default="")
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Optional business reference to an external purchase action (never auto-created).
+    purchase_reference: Mapped[str] = mapped_column(String(120), default="")
+    production_reference: Mapped[str] = mapped_column(String(120), default="")
+    # Printed-form header / sign-off fields (requisition sheet layout).
+    company_name: Mapped[str] = mapped_column(String(160), default="")
+    department_head: Mapped[str] = mapped_column(String(160), default="")
+    checked_by_name: Mapped[str] = mapped_column(String(160), default="")
+    purchase_remarks: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    lines: Mapped[list[PRNLine]] = relationship(
+        back_populates="prn", cascade="all, delete-orphan", order_by="PRNLine.id"
+    )
+    requested_by: Mapped[User | None] = relationship(foreign_keys=[requested_by_id])
+    approved_by: Mapped[User | None] = relationship(foreign_keys=[approved_by_id])
+
+
+class PRNLine(Base):
+    """One requested material line on a PRN. A manual line (no material_id) is a
+    New Material pending master review — its stock is UNKNOWN (NULL), never 0."""
+
+    __tablename__ = "prn_lines"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    prn_id: Mapped[int] = mapped_column(ForeignKey("prns.id"), index=True)
+    entry_mode: Mapped[PRNLineMode] = mapped_column(
+        Enum(PRNLineMode), default=PRNLineMode.manual
+    )
+    material_id: Mapped[int | None] = mapped_column(ForeignKey("products.id"), nullable=True, index=True)
+    # Inventory location the stock snapshot was read from. NULL = Main Store
+    # (the system default, plant_id NULL on Inventory). Read-only reference:
+    # a PRN never writes to Inventory.
+    plant_id: Mapped[int | None] = mapped_column(ForeignKey("plants.id"), nullable=True, index=True)
+    material_code: Mapped[str] = mapped_column(String(120), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    specification: Mapped[str] = mapped_column(Text, default="")
+    quantity: Mapped[float] = mapped_column(Float, default=0)
+    uom: Mapped[str] = mapped_column(String(30), default="")
+    available_stock: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reserved_stock: Mapped[float | None] = mapped_column(Float, nullable=True)
+    incoming_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    suggested_qty: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # PRN-specific stock estimate entered by the requester. This is NEVER an
+    # inventory adjustment; the actual stock snapshot stays in available_stock.
+    # Who/when are kept for auditability of the override.
+    stock_override: Mapped[float | None] = mapped_column(Float, nullable=True)
+    stock_overridden_by_name: Mapped[str] = mapped_column(String(160), default="")
+    stock_overridden_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    remarks: Mapped[str] = mapped_column(Text, default="")
+    attachment_name: Mapped[str] = mapped_column(String(255), default="")
+    attachment_path: Mapped[str] = mapped_column(String(500), default="")
+    is_new_material: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    prn: Mapped[PRN] = relationship(back_populates="lines")
+    material: Mapped[Product | None] = relationship()
+    plant: Mapped[Plant | None] = relationship()

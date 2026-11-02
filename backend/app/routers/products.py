@@ -48,7 +48,8 @@ def create_product(body: ProductCreate, db: Annotated[Session, Depends(get_db)],
         db.commit()
     except Exception:
         db.rollback()
-        raise status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Could not create product (item code / model already in use).")
     db.refresh(p)
     write_audit(db, user, "CREATE", "products", p.id, f"Created product {p.model}")
     return p
@@ -64,10 +65,11 @@ def get_product(product_id: int, db: Annotated[Session, Depends(get_db)],
 def update_product(product_id: int, body: ProductUpdate, db: Annotated[Session, Depends(get_db)],
                    user: ManagerOrAdmin):
     p = get_or_404(db, Product, product_id)
-    apply_updates(p, body)
+    changes = apply_updates(p, body)
     db.commit()
     db.refresh(p)
-    write_audit(db, user, "UPDATE", "products", p.id, f"Updated product {p.model}")
+    write_audit(db, user, "UPDATE", "products", p.id, f"Updated product {p.model}",
+                changes=changes)
     return p
 
 
