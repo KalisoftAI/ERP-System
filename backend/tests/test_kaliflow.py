@@ -32,16 +32,18 @@ def _users(db):
     return admin, viewer
 
 
-def test_toggle_defaults_off_and_blocks_dashboard():
+def test_toggle_defaults_on_and_admin_can_disable():
     db = _session()
-    _, viewer = _users(db)
+    admin, viewer = _users(db)
+    assert kaliflow.get_toggle(viewer, db).enabled is True
+    assert kaliflow.set_toggle(kaliflow.ToggleIn(enabled=False), admin, db).enabled is False
     assert kaliflow.get_toggle(viewer, db).enabled is False
     try:
         kaliflow.dashboard(viewer, db)
     except HTTPException as exc:
         assert exc.status_code == 404
     else:
-        raise AssertionError("dashboard should be disabled by default")
+        raise AssertionError("dashboard should be blocked when disabled")
 
 
 def test_admin_toggles_and_viewer_reads_cached_html():

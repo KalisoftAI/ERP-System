@@ -51,7 +51,14 @@ class AssetIn(BaseModel):
     object_path: str | None = None
 
 
+def _ensure_toggle(db: Session) -> None:
+    if db.get(FeatureToggle, TOGGLE_KEY) is None:
+        db.add(FeatureToggle(key=TOGGLE_KEY, enabled=True))
+        db.commit()
+
+
 def _toggle_row(db: Session) -> FeatureToggle | None:
+    _ensure_toggle(db)
     return db.get(FeatureToggle, TOGGLE_KEY)
 
 
