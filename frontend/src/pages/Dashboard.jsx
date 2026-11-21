@@ -153,6 +153,49 @@ export default function Dashboard() {
       <h2 className="page-title mb-1">Dashboard</h2>
       <p className="page-subtitle mb-6">Overview for <span className="font-semibold text-slate-700">{summary.report_date}</span></p>
 
+      {(kaliflowEnabled || user?.role === 'admin') && (
+        <section className="mb-6" aria-label="Kaliflow 3D plant view">
+          <Card
+            title="Kaliflow Plant View"
+            subtitle="Interactive 3D stretch-film plant demo"
+            actions={user?.role === 'admin' ? (
+              <button
+                type="button"
+                onClick={toggleKaliflow}
+                disabled={kaliflowBusy}
+                className="text-xs text-amber-600 hover:text-amber-700 disabled:opacity-50 flex items-center gap-1"
+              >
+                {kaliflowEnabled ? 'Disable' : 'Enable'} <ArrowRight size={14} />
+              </button>
+            ) : undefined}
+          >
+            {!kaliflowEnabled ? (
+              <div className="py-10 text-center text-sm text-slate-400">Kaliflow view is disabled.</div>
+            ) : (
+              <>
+                {kaliflowSrc ? (
+                  <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                    <iframe
+                      src={kaliflowSrc}
+                      title="Kaliflow 3D manufacturing dashboard"
+                      className="h-[70vh] w-full border-0"
+                      allow="fullscreen"
+                    />
+                  </div>
+                ) : (
+                  <div className="py-10 text-center text-sm text-slate-400">Loading Kaliflow view…</div>
+                )}
+                {kaliflowVideoSrc && (
+                  <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                    <video controls className="w-full" src={kaliflowVideoSrc} />
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
+        </section>
+      )}
+
       {/* KPI row */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 mb-6">
         <StatCard label="Total Orders" value={fmtNum(summary.total_orders)} sub={`${fmtNum(summary.completed_orders)} completed`} icon={ShoppingBag} iconClass="bg-amber-50 text-amber-600" />
@@ -379,49 +422,6 @@ export default function Dashboard() {
           )}
         </Card>
       </div>
-
-      {(kaliflowEnabled || user?.role === 'admin') && (
-        <section className="mt-6" aria-label="Kaliflow 3D plant view">
-          <Card
-            title="Kaliflow Plant View"
-            subtitle="Interactive 3D stretch-film plant demo"
-            actions={user?.role === 'admin' ? (
-              <button
-                type="button"
-                onClick={toggleKaliflow}
-                disabled={kaliflowBusy}
-                className="text-xs text-amber-600 hover:text-amber-700 disabled:opacity-50 flex items-center gap-1"
-              >
-                {kaliflowEnabled ? 'Disable' : 'Enable'} <ArrowRight size={14} />
-              </button>
-            ) : undefined}
-          >
-            {!kaliflowEnabled ? (
-              <div className="py-10 text-center text-sm text-slate-400">Kaliflow view is disabled.</div>
-            ) : (
-              <>
-                {kaliflowSrc ? (
-                  <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
-                    <iframe
-                      src={kaliflowSrc}
-                      title="Kaliflow 3D manufacturing dashboard"
-                      className="h-[70vh] w-full border-0"
-                      allow="fullscreen"
-                    />
-                  </div>
-                ) : (
-                  <div className="py-10 text-center text-sm text-slate-400">Loading Kaliflow view…</div>
-                )}
-                {kaliflowVideoSrc && (
-                  <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
-                    <video controls className="w-full" src={kaliflowVideoSrc} />
-                  </div>
-                )}
-              </>
-            )}
-          </Card>
-        </section>
-      )}
     </div>
   )
 }

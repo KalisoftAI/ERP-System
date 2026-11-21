@@ -61,7 +61,8 @@ def test_admin_toggles_and_viewer_reads_cached_html():
     try:
         response = kaliflow.dashboard(viewer, db)
         assert response.status_code == 200
-        assert response.body == b"<html>Kaliflow</html>"
+        assert b"KALIFLOW_NOS" in response.body
+        assert b"<html>Kaliflow</html>" in response.body
     finally:
         kaliflow._cached_html, kaliflow._cache_expiry, kaliflow._cache_path = original
 

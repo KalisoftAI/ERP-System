@@ -1,4 +1,5 @@
 """JWT-gated Kaliflow 3D plant view served from a database-bound GCS path."""
+import json
 import logging
 import time
 from typing import Annotated
@@ -14,6 +15,7 @@ from ..config import settings
 from ..crud import write_audit
 from ..database import get_db
 from ..models import FeatureToggle, GcsAsset
+from .dashboard import summary as dashboard_summary
 
 router = APIRouter(prefix="/kaliflow", tags=["kaliflow"])
 log = logging.getLogger(__name__)
@@ -127,6 +129,27 @@ def _load_bytes(bucket: str, object_path: str) -> bytes:
         ) from exc
 
 
+def _inject_live_numbers(document: bytes, db: Session, user) -> bytes:
+    data = dashboard_summary(db=db, _=user)
+    total = float(data.get("total_orders") or 0)
+    completed = float(data.get("completed_orders") or 0)
+    produced = float(data.get("production_produced_qty") or 0)
+    stock = float(data.get("raw_material_stock") or 0)
+    resin = max(0, min(100, round(stock / 5000)))
+    nos = {
+        "output": f"{produced / 1000:.2f}",
+        "oee": f"{(completed / total * 100) if total else 0:.1f}%",
+        "dispatched": str(int(data.get("orders_dispatched") or 0)),
+        "resin": f"{resin}%",
+        "resin_pct": str(resin),
+    }
+    payload = json.dumps(nos).replace("<", "\\u003c")
+    script = f"<script>window.KALIFLOW_NOS = {payload};</script>"
+    text = document.decode("utf-8")
+    text = text.replace("<head>", f"<head>{script}", 1) if "<head>" in text else script + text
+    return text.encode("utf-8")
+
+
 @router.get("/assets")
 def list_assets(_: CurrentUser, db: Annotated[Session, Depends(get_db)]):
     _seed_assets(db)
@@ -200,11 +223,11 @@ def set_toggle(
 
 
 @router.get("/dashboard")
-def dashboard(_: CurrentUser, db: Annotated[Session, Depends(get_db)]):
+def dashboard(user: CurrentUser, db: Annotated[Session, Depends(get_db)]):
     if not _is_enabled(db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Kaliflow view is disabled")
     asset = _asset(db, TOGGLE_KEY)
-    html = _load_bytes(asset.bucket, asset.object_path)
+    html = _inject_live_numbers(_load_bytes(asset.bucket, asset.object_path), db, user)
     return Response(
         content=html,
         media_type="text/html",
