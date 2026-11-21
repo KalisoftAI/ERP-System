@@ -56,6 +56,7 @@ export default function Dashboard() {
   const { user } = useAuth()
   const [kaliflowEnabled, setKaliflowEnabled] = useState(false)
   const [kaliflowSrc, setKaliflowSrc] = useState('')
+  const [kaliflowVideoSrc, setKaliflowVideoSrc] = useState('')
   const [kaliflowBusy, setKaliflowBusy] = useState(false)
 
   useEffect(() => {
@@ -94,10 +95,12 @@ export default function Dashboard() {
   useEffect(() => {
     if (!kaliflowEnabled) {
       setKaliflowSrc('')
+      setKaliflowVideoSrc('')
       return undefined
     }
     let cancelled = false
     let objectUrl = ''
+    let videoUrl = ''
     api.get('/kaliflow/dashboard', { responseType: 'text' })
       .then((res) => {
         if (cancelled) return
@@ -107,9 +110,17 @@ export default function Dashboard() {
       .catch(() => {
         if (!cancelled) setKaliflowSrc('')
       })
+    api.get('/kaliflow/asset/kalika_demo_video', { responseType: 'blob' })
+      .then((res) => {
+        if (cancelled) return
+        videoUrl = URL.createObjectURL(res.data)
+        setKaliflowVideoSrc(videoUrl)
+      })
+      .catch(() => {})
     return () => {
       cancelled = true
       if (objectUrl) URL.revokeObjectURL(objectUrl)
+      if (videoUrl) URL.revokeObjectURL(videoUrl)
     }
   }, [kaliflowEnabled])
 
@@ -387,17 +398,26 @@ export default function Dashboard() {
           >
             {!kaliflowEnabled ? (
               <div className="py-10 text-center text-sm text-slate-400">Kaliflow view is disabled.</div>
-            ) : kaliflowSrc ? (
-              <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
-                <iframe
-                  src={kaliflowSrc}
-                  title="Kaliflow 3D manufacturing dashboard"
-                  className="h-[70vh] w-full border-0"
-                  allow="fullscreen"
-                />
-              </div>
             ) : (
-              <div className="py-10 text-center text-sm text-slate-400">Loading Kaliflow view…</div>
+              <>
+                {kaliflowSrc ? (
+                  <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                    <iframe
+                      src={kaliflowSrc}
+                      title="Kaliflow 3D manufacturing dashboard"
+                      className="h-[70vh] w-full border-0"
+                      allow="fullscreen"
+                    />
+                  </div>
+                ) : (
+                  <div className="py-10 text-center text-sm text-slate-400">Loading Kaliflow view…</div>
+                )}
+                {kaliflowVideoSrc && (
+                  <div className="mt-4 overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                    <video controls className="w-full" src={kaliflowVideoSrc} />
+                  </div>
+                )}
+              </>
             )}
           </Card>
         </section>

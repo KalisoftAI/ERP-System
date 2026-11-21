@@ -82,3 +82,20 @@ def test_assets_are_seeded_and_updatable_by_admin():
     )
     assert updated.object_path == "assets/updated.html"
     assert kaliflow._asset(db, "kaliflow_dashboard").object_path == "assets/updated.html"
+
+
+def test_video_asset_is_served_with_mp4_type():
+    db = _session()
+    _, viewer = _users(db)
+    original = (kaliflow._cached_html, kaliflow._cache_expiry, kaliflow._cache_path)
+    video = kaliflow._asset(db, "kalika_demo_video")
+    kaliflow._cached_html = b"\x00\x00\x00\x18ftypmp42"
+    kaliflow._cache_expiry = 1e12
+    kaliflow._cache_path = f"{video.bucket}/{video.object_path}"
+    try:
+        response = kaliflow.asset_file("kalika_demo_video", viewer, db)
+        assert response.status_code == 200
+        assert response.media_type == "video/mp4"
+        assert response.body.startswith(b"\x00\x00\x00\x18ftyp")
+    finally:
+        kaliflow._cached_html, kaliflow._cache_expiry, kaliflow._cache_path = original

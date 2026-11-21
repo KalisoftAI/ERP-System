@@ -23,6 +23,11 @@ DEFAULT_ASSETS = {
     TOGGLE_KEY: (settings.KALIFLOW_GCS_BUCKET, settings.KALIFLOW_GCS_OBJECT, "html"),
     "kalika_logo": ("sales-crm", "assets/Kalika-Logo.png", "logo"),
     "kalisoftai_logo": ("sales-crm", "assets/KalisoftAI Logo - 1.png", "logo"),
+    "kalika_demo_video": (
+        "sales-crm",
+        "Manufacturing-Data/kalika-videos/app-demo-videos/15-30-12.mp4",
+        "video",
+    ),
 }
 _cached_html: bytes | None = None
 _cache_expiry = 0.0
@@ -95,7 +100,7 @@ def _asset_out(row: GcsAsset) -> AssetOut:
     )
 
 
-def _load_html(bucket: str, object_path: str) -> bytes:
+def _load_bytes(bucket: str, object_path: str) -> bytes:
     global _cached_html, _cache_expiry, _cache_path
     now = time.monotonic()
     path = f"{bucket}/{object_path}"
@@ -148,6 +153,24 @@ def update_asset(
     return _asset_out(row)
 
 
+@router.get("/asset/{key}")
+def asset_file(key: str, _: CurrentUser, db: Annotated[Session, Depends(get_db)]):
+    if not _is_enabled(db):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Kaliflow view is disabled")
+    row = _asset(db, key)
+    data = _load_bytes(row.bucket, row.object_path)
+    media_type = {
+        "html": "text/html",
+        "video": "video/mp4",
+        "logo": "image/png",
+    }.get(row.kind, "application/octet-stream")
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
+
 @router.get("/toggle", response_model=ToggleOut)
 def get_toggle(_: CurrentUser, db: Annotated[Session, Depends(get_db)]):
     return ToggleOut(enabled=_is_enabled(db))
@@ -181,7 +204,7 @@ def dashboard(_: CurrentUser, db: Annotated[Session, Depends(get_db)]):
     if not _is_enabled(db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Kaliflow view is disabled")
     asset = _asset(db, TOGGLE_KEY)
-    html = _load_html(asset.bucket, asset.object_path)
+    html = _load_bytes(asset.bucket, asset.object_path)
     return Response(
         content=html,
         media_type="text/html",
