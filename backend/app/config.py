@@ -39,6 +39,9 @@ class Settings(BaseSettings):
     GCS_BUCKET: str = "kalisoftai-datahub"
     GCS_EXCEL_FILE: str = "Kalika_inventory/Daily Report Aug-26.xlsx"
     GCS_STAMP_FILE: str = "Kalika_inventory/stamp.png"
+    KALIFLOW_GCS_BUCKET: str = "sales-crm"
+    KALIFLOW_GCS_OBJECT: str = "assets/kaliflow_kalika_enterprises_3d_manufacturing_dashboard.html"
+    KALIFLOW_CACHE_SECONDS: int = 300
     GOOGLE_APPLICATION_CREDENTIALS: str | None = None
     REPORT_DIR: Path = BASE_DIR / "reports"
 

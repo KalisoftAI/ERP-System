@@ -9,6 +9,7 @@ import {
   PieChart, Pie, Cell, Legend,
 } from 'recharts'
 import api from '../lib/api'
+import { useAuth } from '../context/AuthContext'
 import { Card, StatCard, Loading, LoadingSkeleton } from '../components/ui'
 import { fmtNum, FlowBadge } from '../lib/format'
 
@@ -52,6 +53,10 @@ export default function Dashboard() {
   const [alerts, setAlerts] = useState({ unread: 0, total_open: 0, critical_unread: 0 })
   const [rmShortage, setRmShortage] = useState([])
   const [loading, setLoading] = useState(true)
+  const { user } = useAuth()
+  const [kaliflowEnabled, setKaliflowEnabled] = useState(false)
+  const [kaliflowSrc, setKaliflowSrc] = useState('')
+  const [kaliflowBusy, setKaliflowBusy] = useState(false)
 
   useEffect(() => {
     Promise.all([
@@ -79,6 +84,46 @@ export default function Dashboard() {
       .catch(() => {})
       .finally(() => setLoading(false))
   }, [])
+
+  useEffect(() => {
+    api.get('/kaliflow/toggle')
+      .then((res) => setKaliflowEnabled(Boolean(res.data.enabled)))
+      .catch(() => {})
+  }, [])
+
+  useEffect(() => {
+    if (!kaliflowEnabled) {
+      setKaliflowSrc('')
+      return undefined
+    }
+    let cancelled = false
+    let objectUrl = ''
+    api.get('/kaliflow/dashboard', { responseType: 'text' })
+      .then((res) => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(new Blob([res.data], { type: 'text/html' }))
+        setKaliflowSrc(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setKaliflowSrc('')
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [kaliflowEnabled])
+
+  const toggleKaliflow = async () => {
+    setKaliflowBusy(true)
+    try {
+      const { data } = await api.patch('/kaliflow/toggle', { enabled: !kaliflowEnabled })
+      setKaliflowEnabled(Boolean(data.enabled))
+    } catch {
+      return
+    } finally {
+      setKaliflowBusy(false)
+    }
+  }
 
   if (loading && !summary) return (
     <div>
@@ -323,6 +368,40 @@ export default function Dashboard() {
           )}
         </Card>
       </div>
+
+      {(kaliflowEnabled || user?.role === 'admin') && (
+        <section className="mt-6" aria-label="Kaliflow 3D plant view">
+          <Card
+            title="Kaliflow Plant View"
+            subtitle="Interactive 3D stretch-film plant demo"
+            actions={user?.role === 'admin' ? (
+              <button
+                type="button"
+                onClick={toggleKaliflow}
+                disabled={kaliflowBusy}
+                className="text-xs text-amber-600 hover:text-amber-700 disabled:opacity-50 flex items-center gap-1"
+              >
+                {kaliflowEnabled ? 'Disable' : 'Enable'} <ArrowRight size={14} />
+              </button>
+            ) : undefined}
+          >
+            {!kaliflowEnabled ? (
+              <div className="py-10 text-center text-sm text-slate-400">Kaliflow view is disabled.</div>
+            ) : kaliflowSrc ? (
+              <div className="overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                <iframe
+                  src={kaliflowSrc}
+                  title="Kaliflow 3D manufacturing dashboard"
+                  className="h-[70vh] w-full border-0"
+                  allow="fullscreen"
+                />
+              </div>
+            ) : (
+              <div className="py-10 text-center text-sm text-slate-400">Loading Kaliflow view…</div>
+            )}
+          </Card>
+        </section>
+      )}
     </div>
   )
 }

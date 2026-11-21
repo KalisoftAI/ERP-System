@@ -137,6 +137,24 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class FeatureToggle(Base):
+    __tablename__ = "feature_toggles"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class GcsAsset(Base):
+    __tablename__ = "gcs_assets"
+
+    key: Mapped[str] = mapped_column(String(80), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(30), default="asset")
+    bucket: Mapped[str] = mapped_column(String(120))
+    object_path: Mapped[str] = mapped_column(String(500))
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class Customer(Base):
     __tablename__ = "customers"
 

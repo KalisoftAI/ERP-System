@@ -14,7 +14,7 @@ from .database import Base, engine, check_db_health
 from . import models  # noqa: F401  (register models)
 from .routers import (
     auth, users, meta, customers, suppliers, products, plants, raw_materials,
-    purchases, inventory, production, orders, dispatch, plans, dashboard, reports,
+    purchases, inventory, production, orders, dispatch, plans, dashboard, kaliflow, reports,
     requirements, salespersons, local_orders, bom, alerts,
     material_requirements, fulfilment, stock_flow, quotations, packaging_lists,
     employees, prns, activity_log,
@@ -535,6 +535,7 @@ app.include_router(orders.router)
 app.include_router(dispatch.router)
 app.include_router(plans.router)
 app.include_router(dashboard.router)
+app.include_router(kaliflow.router)
 app.include_router(reports.router)
 app.include_router(requirements.router)
 app.include_router(salespersons.router)
