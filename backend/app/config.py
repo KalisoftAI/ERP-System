@@ -40,7 +40,10 @@ class Settings(BaseSettings):
     GCS_EXCEL_FILE: str = "Kalika_inventory/Daily Report Aug-26.xlsx"
     GCS_STAMP_FILE: str = "Kalika_inventory/stamp.png"
     KALIFLOW_GCS_BUCKET: str = "sales-crm"
-    KALIFLOW_GCS_OBJECT: str = "assets/UI/kaliflow_kalika_enterprises_3d_manufacturing_dashboard.html"
+    KALIFLOW_GCS_OBJECT: str = "assets/Html-data/Kaliflow - Kalika Enterprises 3D Manufacturing Dashboard (18).html"
+    KALIFLOW_VIDEO_OBJECT: str = "assets/Videos/ScreenVideo_20261123_064013.mp4"
+    KALIFLOW_LOGO_OBJECT: str = "assets/Kalika-Logo.png"
+    KALIFLOW_SOFT_LOGO_OBJECT: str = "assets/KalisoftAI Logo - 1.png"
     KALIFLOW_CACHE_SECONDS: int = 300
     GOOGLE_APPLICATION_CREDENTIALS: str | None = None
     REPORT_DIR: Path = BASE_DIR / "reports"

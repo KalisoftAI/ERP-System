@@ -1,9 +1,7 @@
 """JWT-gated Kaliflow 3D plant view served from a database-bound GCS path."""
 import json
 import logging
-import time
 from typing import Annotated
-from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response
@@ -11,10 +9,20 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..auth import AdminUser, CurrentUser
-from ..config import settings
 from ..crud import write_audit
 from ..database import get_db
 from ..models import FeatureToggle, GcsAsset
+from ..services.kaliflow_assets import (
+    AssetFetchError,
+    AssetSpec,
+    AssetValidationError,
+    allowed_buckets,
+    asset_reader,
+    asset_registry,
+    public_url,
+    reconcile_assets,
+    validate_asset_update,
+)
 from .dashboard import summary as dashboard_summary
 
 router = APIRouter(prefix="/kaliflow", tags=["kaliflow"])
@@ -22,18 +30,9 @@ log = logging.getLogger(__name__)
 
 TOGGLE_KEY = "kaliflow_dashboard"
 DEFAULT_ASSETS = {
-    TOGGLE_KEY: (settings.KALIFLOW_GCS_BUCKET, settings.KALIFLOW_GCS_OBJECT, "html"),
-    "kalika_logo": ("sales-crm", "assets/Kalika-Logo.png", "logo"),
-    "kalisoftai_logo": ("sales-crm", "assets/KalisoftAI Logo - 1.png", "logo"),
-    "kalika_demo_video": (
-        "sales-crm",
-        "Manufacturing-Data/kalika-videos/app-demo-videos/15-30-12.mp4",
-        "video",
-    ),
+    key: (spec.bucket, spec.object_path, spec.kind)
+    for key, spec in asset_registry.items()
 }
-_cached_html: bytes | None = None
-_cache_expiry = 0.0
-_cache_path = ""
 
 
 class ToggleOut(BaseModel):
@@ -75,13 +74,7 @@ def _is_enabled(db: Session) -> bool:
 
 
 def _seed_assets(db: Session) -> None:
-    changed = False
-    for key, (bucket, object_path, kind) in DEFAULT_ASSETS.items():
-        if db.get(GcsAsset, key) is None:
-            db.add(GcsAsset(key=key, kind=kind, bucket=bucket, object_path=object_path))
-            changed = True
-    if changed:
-        db.commit()
+    reconcile_assets(db)
 
 
 def _asset(db: Session, key: str) -> GcsAsset:
@@ -98,35 +91,22 @@ def _asset_out(row: GcsAsset) -> AssetOut:
         kind=row.kind,
         bucket=row.bucket,
         object_path=row.object_path,
-        url=f"https://storage.googleapis.com/{row.bucket}/{quote(row.object_path)}",
+        url=public_url(row.bucket, row.object_path),
     )
 
 
-def _load_bytes(bucket: str, object_path: str) -> bytes:
-    global _cached_html, _cache_expiry, _cache_path
-    now = time.monotonic()
-    path = f"{bucket}/{object_path}"
-    if _cached_html is not None and now < _cache_expiry and _cache_path == path:
-        return _cached_html
+def _read_asset(row: GcsAsset) -> bytes:
+    spec = AssetSpec(row.key, row.kind, row.bucket, row.object_path)
     try:
-        from google.cloud import storage
-
-        client = storage.Client()
-        blob = client.bucket(bucket).blob(object_path)
-        html = blob.download_as_bytes()
-        _cached_html = html
-        _cache_expiry = now + max(0, settings.KALIFLOW_CACHE_SECONDS)
-        _cache_path = path
-        return html
-    except Exception as exc:
-        log.warning("Kaliflow GCS fetch failed for %s: %s", path, exc)
-        if _cached_html is not None and _cache_path == path:
-            _cache_expiry = now + 30
-            return _cached_html
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Kaliflow dashboard is unavailable",
-        ) from exc
+        return asset_reader.read(spec, allowed_buckets())
+    except AssetValidationError as exc:
+        log.warning("Rejecting invalid Kaliflow asset %s: %s", row.key, exc)
+    except AssetFetchError:
+        pass
+    raise HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "Kaliflow asset is unavailable",
+    )
 
 
 def _inject_live_numbers(document: bytes, db: Session, user) -> bytes:
@@ -168,10 +148,18 @@ def update_asset(
     data = body.model_dump(exclude_none=True)
     if not data:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "No fields to update")
+    try:
+        candidate = validate_asset_update(key, data)
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"Asset {key} not found") from exc
+    except AssetValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    asset_reader.invalidate(row.bucket, row.object_path)
     for field in ("kind", "bucket", "object_path"):
         if field in data:
-            setattr(row, field, data[field])
+            setattr(row, field, getattr(candidate, field))
     db.commit()
+    asset_reader.invalidate(candidate.bucket, candidate.object_path)
     write_audit(db, user, "KALIFLOW_ASSET", "kaliflow", None, f"Updated GCS asset {key}")
     return _asset_out(row)
 
@@ -181,12 +169,13 @@ def asset_file(key: str, _: CurrentUser, db: Annotated[Session, Depends(get_db)]
     if not _is_enabled(db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Kaliflow view is disabled")
     row = _asset(db, key)
-    data = _load_bytes(row.bucket, row.object_path)
-    media_type = {
-        "html": "text/html",
-        "video": "video/mp4",
-        "logo": "image/png",
-    }.get(row.kind, "application/octet-stream")
+    data = _read_asset(row)
+    media_type = AssetSpec(
+        key=row.key,
+        kind=row.kind,
+        bucket=row.bucket,
+        object_path=row.object_path,
+    ).media_type
     return Response(
         content=data,
         media_type=media_type,
@@ -227,7 +216,7 @@ def dashboard(user: CurrentUser, db: Annotated[Session, Depends(get_db)]):
     if not _is_enabled(db):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Kaliflow view is disabled")
     asset = _asset(db, TOGGLE_KEY)
-    html = _inject_live_numbers(_load_bytes(asset.bucket, asset.object_path), db, user)
+    html = _inject_live_numbers(_read_asset(asset), db, user)
     return Response(
         content=html,
         media_type="text/html",

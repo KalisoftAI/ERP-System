@@ -489,6 +489,14 @@ def on_startup():
         log.info("Inventory uniqueness for Main Store enforced.")
     except Exception as exc:
         log.error("inventory uniqueness migration failed (recoverable): %s", exc)
+    try:
+        from .database import SessionLocal
+        from .services.kaliflow_assets import reconcile_assets
+        with SessionLocal() as s:
+            if reconcile_assets(s):
+                log.info("Kaliflow asset paths reconciled.")
+    except Exception as exc:
+        log.error("Kaliflow asset reconcile failed (recoverable): %s", exc)
     # Reconcile purchase/production shortage requirements + alerts on boot so
     # the Alert Centre is current even for data imported or changed outside the
     # API. Dedupe-safe and non-fatal (best-effort).
