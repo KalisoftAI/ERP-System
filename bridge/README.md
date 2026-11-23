@@ -157,7 +157,21 @@ The bridge reports one health status at a time through heartbeats and `/producti
 - `STABLE` - fresh valid stable reading available.
 - `DEVICE_ERROR` - socket or protocol error/overload.
 
-`last_byte_at` and `last_valid_reading_at` are tracked separately. A live TCP socket with no valid scale data is not reported as a healthy weighing device. The UI page `/machine-bridge` shows device health, gateway IP/port, MAC, parser mode, dry-run flag, latest reading, reading age, raw frames, parse errors and the transaction inbox. It polls every 5 seconds and does not modify production records.
+`last_byte_at` and `last_valid_reading_at` are tracked separately. A live TCP socket with no valid scale data is not reported as a healthy weighing device. The UI page `/machine-bridge` shows device health, gateway IP/port, MAC, parser mode, dry-run flag, latest reading, reading age, raw frames, parse errors, diagnostics and the transaction inbox. It polls every 2 seconds and does not modify production records.
+
+## Polling diagnostics and error breakdown
+
+The bridge emits `device.poll.summary` every `DIAGNOSTICS_POLL_INTERVAL_SECONDS` (default `2`) with device health, byte count, frame counts, reading counts, queue counts, error counts, last timestamps and the current error message. Every classified failure also emits `device.poll.error` with a category: `device`, `frame`, `parse`, `stale`, `erp`, `erp_frame`, `erp_heartbeat` or `erp_status`.
+
+The same breakdown is attached to heartbeats and returned by `GET /production/machine/status`:
+
+- `diagnostics` - last bridge-generated poll snapshot.
+- `error_breakdown.bridge` - categorized bridge error counts.
+- `error_breakdown.frames` - grouped raw-frame error messages from ERP storage.
+- `error_breakdown.transactions` - grouped failed transaction error messages from ERP storage.
+- `recent_errors` - latest frame and transaction errors for quick triage.
+
+The `/machine-bridge` UI shows these counters, grouped messages and recent errors so unresolved issues can be identified without reading raw JSON logs. Lower `DIAGNOSTICS_POLL_INTERVAL_SECONDS` for faster troubleshooting; raise it to reduce log volume.
 
 ## API telemetry and UI
 
@@ -187,6 +201,7 @@ Structured JSON logs are written to `LOG_DIR/LOG_FILE_NAME` with rotation. Every
 - `device.parse.succeeded`, `device.parse.failed`
 - `device.reading.stale`, `device.reading.captured`, `device.reading.rejected`
 - `device.worker.started`, `device.worker.stopped`, `device.health.changed`
+- `device.poll.summary`, `device.poll.error`
 - `erp.request`, `erp.response`, `erp.status`, `erp.status.error`
 - `queue.enqueued`, `queue.sent`, `queue.retry`, `queue.dead`
 - `gcs.upload.success`, `gcs.upload.error`

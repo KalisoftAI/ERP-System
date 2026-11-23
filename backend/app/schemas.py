@@ -1549,6 +1549,12 @@ class MachineHeartbeatIn(BaseModel):
     last_valid_reading_at: Optional[str] = Field(default=None, max_length=60)
     reading_age_seconds: Optional[float] = Field(default=None, ge=0)
     sequence: int = Field(default=0, ge=0)
+    error_breakdown: dict[str, int] = Field(default_factory=dict)
+    frame_counts: dict[str, int] = Field(default_factory=dict)
+    reading_counts: dict[str, int] = Field(default_factory=dict)
+    queue_counts: dict[str, int] = Field(default_factory=dict)
+    poll_interval_seconds: float = Field(default=0, ge=0)
+    diagnostics_generated_at: str = Field(default="", max_length=60)
 
     @field_validator("status", "health_status", mode="before")
     @classmethod

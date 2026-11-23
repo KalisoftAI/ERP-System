@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Activity, AlertTriangle, Cpu, Database, Radio, RefreshCw } from 'lucide-react'
+import { Activity, AlertTriangle, Cpu, Database, ListChecks, Radio, RefreshCw } from 'lucide-react'
 import api from '../lib/api'
 import { Badge, Card, Empty, Loading, PageHeader, PageTabs, StatCard } from '../components/ui'
 
@@ -9,6 +9,22 @@ const TABS = [
 ]
 
 const fmtWhen = (value) => (value ? String(value).replace('T', ' ').slice(0, 19) : '-')
+
+const ErrorRows = ({ title, rows }) => (
+  <div>
+    <div className="text-xs font-semibold uppercase tracking-wide text-slate-500">{title}</div>
+    {rows.length ? (
+      <div className="mt-2 space-y-1">
+        {rows.map(([message, count]) => (
+          <div key={message} className="flex justify-between gap-3 text-xs">
+            <span className="min-w-0 truncate text-slate-600" title={message}>{message || '-'}</span>
+            <Badge className={statusClass('RETRY')}>{count}</Badge>
+          </div>
+        ))}
+      </div>
+    ) : <div className="mt-2 text-xs text-slate-400">None</div>}
+  </div>
+)
 
 const statusClass = (value) => {
   const text = String(value || '').toUpperCase()
@@ -57,7 +73,7 @@ export default function MachineBridge() {
 
   useEffect(() => {
     load()
-    const timer = setInterval(load, 5000)
+    const timer = setInterval(load, 2000)
     return () => clearInterval(timer)
   }, [load])
 
@@ -67,6 +83,12 @@ export default function MachineBridge() {
   const txnCounts = status?.counters || {}
   const lastFrame = status?.last_frame || null
   const lastTransaction = status?.last_transaction || null
+  const diagnostics = status?.diagnostics || {}
+  const errorBreakdown = status?.error_breakdown || {}
+  const recentErrors = status?.recent_errors || []
+  const bridgeErrors = Object.entries(errorBreakdown.bridge || {})
+  const frameErrors = Object.entries(errorBreakdown.frames || {})
+  const transactionErrors = Object.entries(errorBreakdown.transactions || {})
 
   return (
     <div className="animate-fade-in-up">
@@ -121,6 +143,42 @@ export default function MachineBridge() {
               <div className="flex justify-between gap-4"><span className="text-slate-500">GCS upload</span><span>{String(config.gcs_upload_enabled ?? '-')}</span></div>
               <div className="flex justify-between gap-4"><span className="text-slate-500">Reading age</span><span>{config.reading_age_seconds == null ? '-' : `${Number(config.reading_age_seconds).toFixed(1)}s`}</span></div>
               <div className="pt-2 border-t border-gray-100 text-xs text-slate-500">{status?.integration_note || '-'}</div>
+            </div>
+          )}
+        </Card>
+      </div>
+
+      <div className="mt-4">
+        <Card
+          title="Polling Diagnostics"
+          subtitle={`Bridge log interval ${diagnostics.poll_interval_seconds || '-'}s · generated ${fmtWhen(diagnostics.generated_at)}`}
+          actions={<Badge className={statusClass(diagnostics.last_error ? 'ERROR' : 'CONNECTED')}>{diagnostics.last_error ? 'errors present' : 'no bridge errors'}</Badge>}
+        >
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 text-sm">
+            <div className="space-y-3">
+              <ErrorRows title="Bridge error breakdown" rows={bridgeErrors} />
+              <div className="space-y-1 text-xs text-slate-500">
+                <div>Frames: {diagnostics.frame_counts?.received || 0} received · {diagnostics.frame_counts?.parsed || 0} parsed · {diagnostics.frame_counts?.failed || 0} failed</div>
+                <div>Readings: {diagnostics.reading_counts?.captured || 0} captured · {diagnostics.reading_counts?.rejected || 0} rejected</div>
+                <div>Queue: {diagnostics.queue_counts?.PENDING || 0} pending · {diagnostics.queue_counts?.SENT || 0} sent · {diagnostics.queue_counts?.DEAD || 0} dead</div>
+              </div>
+            </div>
+            <ErrorRows title="Raw frame errors" rows={frameErrors} />
+            <ErrorRows title="Transaction errors" rows={transactionErrors} />
+          </div>
+          {recentErrors.length > 0 && (
+            <div className="mt-4 border-t border-gray-100 pt-3">
+              <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500"><ListChecks size={14} /> Recent errors</div>
+              <div className="mt-2 space-y-1">
+                {recentErrors.map((item, index) => (
+                  <div key={`${item.source}-${index}`} className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
+                    <span className="font-mono text-slate-400">{fmtWhen(item.created_at)}</span>
+                    <span className="font-semibold text-slate-600">{item.source}</span>
+                    <span className="min-w-0 break-all text-red-600">{item.message}</span>
+                    {item.transaction_id && <span className="font-mono text-slate-400">{item.transaction_id}</span>}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </Card>

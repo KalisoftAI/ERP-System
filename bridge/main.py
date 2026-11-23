@@ -69,6 +69,10 @@ class BridgeApp:
         self.connect_phase = False
         self._last_display = 0.0
         self._last_status_check = 0.0
+        self._last_poll_log = 0.0
+        self.frame_counts = {"received": 0, "parsed": 0, "failed": 0}
+        self.reading_counts = {"captured": 0, "rejected": 0}
+        self.error_counts: dict[str, int] = {}
 
     def run(self) -> None:
         self.logger.start_uploader()
@@ -114,11 +118,13 @@ class BridgeApp:
                         if not chunk:
                             self._check_stale()
                             self._maybe_check_erp_status()
+                            self._maybe_emit_poll_summary()
                             self._display(force=False)
                             continue
                         self._handle_chunk(chunk, buffer)
                         self._process_queue()
                         self._maybe_check_erp_status()
+                        self._maybe_emit_poll_summary()
                         self._display(force=False)
                     for frame in buffer.flush():
                         self._handle_frame(frame)
@@ -144,7 +150,7 @@ class BridgeApp:
                         self.device = None
                     self.connect_phase = False
                     self._set_health("DISCONNECTED")
-                    self._send_heartbeat()
+                    self._maybe_emit_poll_summary(force=True)
                     delay = self._reconnect_delay()
                     self.logger.event(
                         "device.reconnect.scheduled",
@@ -186,6 +192,8 @@ class BridgeApp:
         try:
             frames = buffer.feed(chunk)
         except ParserError as exc:
+            self.frame_counts["failed"] += 1
+            self._record_error("frame", str(exc))
             self.logger.event(
                 "device.frame.invalid",
                 component="weighing.framing",
@@ -198,6 +206,7 @@ class BridgeApp:
         if not frames:
             self._set_health("RECEIVING_UNPARSED")
             return
+        self.frame_counts["received"] += len(frames)
         for frame in frames:
             self._handle_frame(frame)
 
@@ -213,7 +222,9 @@ class BridgeApp:
         try:
             result = self.parser.parse(frame.text, frame.hex, self.config)
         except ParserError as exc:
+            self.frame_counts["failed"] += 1
             self.state["error"] = str(exc)
+            self._record_error("parse", str(exc))
             self.logger.event(
                 "device.parse.failed",
                 component="weighing.parser",
@@ -236,6 +247,7 @@ class BridgeApp:
         self.last_valid_reading_at = _utc_now()
         self.last_reading_monotonic = time.monotonic()
         self.stale_logged = False
+        self.frame_counts["parsed"] += 1
         self.logger.event(
             "device.parse.succeeded",
             component="weighing.parser",
@@ -263,6 +275,7 @@ class BridgeApp:
         error_message = getattr(device, "error", "") or str(exc)
         self.state["device"] = "DISCONNECTED"
         self.state["error"] = error_message
+        self._record_error("device", error_message)
         connecting = self.connect_phase
         self.logger.event(
             "device.connect.failed" if connecting else "device.error",
@@ -289,6 +302,7 @@ class BridgeApp:
         if age < self.config.device_stale_after_seconds:
             return
         self.stale_logged = True
+        self._record_error("stale", f"no valid reading for {age:.1f}s")
         self.logger.event(
             "device.reading.stale",
             component="weighing.service",
@@ -313,6 +327,64 @@ class BridgeApp:
             sequence=self.sequence,
         )
 
+    def _record_error(self, category: str, message: str = "") -> None:
+        key = str(category or "unknown").strip().lower()[:40]
+        self.error_counts[key] = self.error_counts.get(key, 0) + 1
+        self.logger.event(
+            "device.poll.error",
+            component="weighing.diagnostics",
+            category=key,
+            error_message=str(message)[:500],
+            error_breakdown=dict(self.error_counts),
+            sequence=self.sequence,
+            level=30,
+        )
+
+    def _diagnostics_snapshot(self) -> dict:
+        return {
+            "generated_at": _utc_now(),
+            "poll_interval_seconds": self.config.diagnostics_poll_interval_seconds,
+            "device_health": self.health,
+            "device_status": self.state["device"],
+            "erp_status": self.state["erp"],
+            "connection_id": self.connection_id,
+            "sequence": self.sequence,
+            "bytes_received": self.bytes_received,
+            "frame_counts": dict(self.frame_counts),
+            "reading_counts": dict(self.reading_counts),
+            "error_breakdown": dict(self.error_counts),
+            "queue_counts": self.queue.counts(),
+            "last_byte_at": self.last_byte_at,
+            "last_valid_reading_at": self.last_valid_reading_at,
+            "reading_age_seconds": self._reading_age_seconds(),
+            "last_error": self.state["error"],
+        }
+
+    def _maybe_emit_poll_summary(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_poll_log < max(
+            self.config.diagnostics_poll_interval_seconds, 0.2
+        ):
+            return
+        self._last_poll_log = now
+        try:
+            snapshot = self._diagnostics_snapshot()
+            self.logger.event(
+                "device.poll.summary",
+                component="weighing.diagnostics",
+                **snapshot,
+            )
+            self._send_heartbeat(snapshot)
+        except Exception as exc:
+            self.logger.event(
+                "device.poll.error",
+                component="weighing.diagnostics",
+                category="diagnostics",
+                error_message=str(exc),
+                error_code=type(exc).__name__,
+                level=30,
+            )
+
     def _reconnect_delay(self) -> float:
         bounded = min(
             self.config.device_reconnect_max_seconds,
@@ -332,8 +404,9 @@ class BridgeApp:
         fields["raw_hex_preview"] = frame.hex[: limit * 2]
         return fields
 
-    def _send_heartbeat(self) -> None:
+    def _send_heartbeat(self, snapshot: dict | None = None) -> None:
         try:
+            diagnostics = snapshot or self._diagnostics_snapshot()
             self.erp.post_heartbeat({
                 "status": self.health,
                 "health_status": self.health,
@@ -349,10 +422,19 @@ class BridgeApp:
                 "last_gross_weight": _float_or_none(self.state["weight"]),
                 "last_byte_at": self.last_byte_at,
                 "last_valid_reading_at": self.last_valid_reading_at,
-                "reading_age_seconds": self._reading_age_seconds(),
+                "reading_age_seconds": diagnostics.get("reading_age_seconds"),
                 "sequence": self.sequence,
+                "error_breakdown": diagnostics.get("error_breakdown", {}),
+                "frame_counts": diagnostics.get("frame_counts", {}),
+                "reading_counts": diagnostics.get("reading_counts", {}),
+                "queue_counts": diagnostics.get("queue_counts", {}),
+                "poll_interval_seconds": diagnostics.get(
+                    "poll_interval_seconds", self.config.diagnostics_poll_interval_seconds
+                ),
+                "diagnostics_generated_at": diagnostics.get("generated_at", ""),
             })
         except Exception as exc:
+            self._record_error("erp_heartbeat", str(exc))
             self.logger.event(
                 "erp.heartbeat.error",
                 component="weighing.erp",
@@ -394,6 +476,7 @@ class BridgeApp:
         try:
             self.erp.post_frame(event)
         except Exception as exc:
+            self._record_error("erp_frame", str(exc))
             self.logger.event(
                 "erp.frame.error",
                 component="weighing.erp",
@@ -415,6 +498,7 @@ class BridgeApp:
                 self.queue.mark_sent(event["id"], response_text)
                 self.state["erp"] = str(result.body.get("status", "OK")) if result.body else "OK"
                 self.state["error"] = ""
+                self.reading_counts["captured"] += 1
                 self.logger.event(
                     "device.reading.captured",
                     component="weighing.service",
@@ -442,6 +526,7 @@ class BridgeApp:
                 )
                 self.state["erp"] = "RETRY"
                 self.state["error"] = result.error
+                self._record_error("erp", result.error)
                 self.logger.event(
                     "queue.retry",
                     component="weighing.queue",
@@ -464,6 +549,8 @@ class BridgeApp:
                 )
                 self.state["erp"] = "REJECTED"
                 self.state["error"] = result.error
+                self.reading_counts["rejected"] += 1
+                self._record_error("erp", result.error)
                 self.logger.event(
                     "device.reading.rejected",
                     component="weighing.service",
@@ -496,6 +583,7 @@ class BridgeApp:
         except Exception as exc:
             self.state["erp"] = "ERROR"
             self.state["error"] = str(exc)
+            self._record_error("erp_status", str(exc))
             self.logger.event(
                 "erp.status.error",
                 component="weighing.erp",

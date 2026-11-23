@@ -255,10 +255,69 @@ def machine_status(db: Annotated[Session, Depends(get_db)], _: CurrentUser):
         bridge_config = {}
     if not isinstance(bridge_config, dict):
         bridge_config = {}
+    frame_error_rows = db.execute(
+        select(MachineRawFrame.error_message, func.count())
+        .where(MachineRawFrame.error_message != "")
+        .group_by(MachineRawFrame.error_message)
+        .order_by(func.count().desc())
+        .limit(20)
+    ).all()
+    txn_error_rows = db.execute(
+        select(WeighingTransaction.error_message, func.count())
+        .where(
+            WeighingTransaction.status == ws.TXN_FAILED,
+            WeighingTransaction.error_message != "",
+        )
+        .group_by(WeighingTransaction.error_message)
+        .order_by(func.count().desc())
+        .limit(20)
+    ).all()
+    recent_frame_errors = db.scalars(
+        select(MachineRawFrame)
+        .where(MachineRawFrame.error_message != "")
+        .order_by(MachineRawFrame.created_at.desc(), MachineRawFrame.id.desc())
+        .limit(5)
+    ).all()
+    recent_txn_errors = db.scalars(
+        select(WeighingTransaction)
+        .where(
+            WeighingTransaction.status == ws.TXN_FAILED,
+            WeighingTransaction.error_message != "",
+        )
+        .order_by(WeighingTransaction.received_at.desc(), WeighingTransaction.id.desc())
+        .limit(5)
+    ).all()
+    error_map = lambda rows: {
+        str(message)[:300]: int(count) for message, count in rows if message
+    }
+    recent_errors = [
+        {"source": "frame", "message": str(item.error_message)[:300],
+         "created_at": item.created_at, "transaction_id": item.transaction_id or ""}
+        for item in recent_frame_errors
+    ] + [
+        {"source": "transaction", "message": str(item.error_message)[:300],
+         "created_at": item.received_at, "transaction_id": item.transaction_uid}
+        for item in recent_txn_errors
+    ]
+    diagnostics = {
+        "poll_interval_seconds": bridge_config.get("poll_interval_seconds", 0),
+        "generated_at": bridge_config.get("diagnostics_generated_at", ""),
+        "frame_counts": bridge_config.get("frame_counts", {}),
+        "reading_counts": bridge_config.get("reading_counts", {}),
+        "queue_counts": bridge_config.get("queue_counts", {}),
+        "last_error": conn.last_error or "",
+    }
     return {
         "connection": mi.serialize_connection(conn),
         "device_health": bridge_config.get("health_status") or conn.status,
         "health_statuses": list(mi.BRIDGE_HEALTH_STATUSES),
+        "diagnostics": diagnostics,
+        "error_breakdown": {
+            "bridge": bridge_config.get("error_breakdown", {}),
+            "frames": error_map(frame_error_rows),
+            "transactions": error_map(txn_error_rows),
+        },
+        "recent_errors": recent_errors,
         "counters": {
             "received_today": received_today,
             "processed": counts.get(ws.TXN_PROCESSED, 0),
@@ -324,6 +383,12 @@ def receive_machine_heartbeat(
         last_valid_reading_at=body.last_valid_reading_at,
         reading_age_seconds=body.reading_age_seconds,
         sequence=body.sequence,
+        error_breakdown=body.error_breakdown,
+        frame_counts=body.frame_counts,
+        reading_counts=body.reading_counts,
+        queue_counts=body.queue_counts,
+        poll_interval_seconds=body.poll_interval_seconds,
+        diagnostics_generated_at=body.diagnostics_generated_at,
     )
     return mi.serialize_connection(conn)
 

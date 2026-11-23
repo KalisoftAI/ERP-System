@@ -268,6 +268,12 @@ def record_bridge_heartbeat(
     last_valid_reading_at: str | None,
     reading_age_seconds: float | None,
     sequence: int,
+    error_breakdown: dict[str, int],
+    frame_counts: dict[str, int],
+    reading_counts: dict[str, int],
+    queue_counts: dict[str, int],
+    poll_interval_seconds: float,
+    diagnostics_generated_at: str,
 ) -> MachineConnection:
     conn = get_or_create_connection(db)
     try:
@@ -293,6 +299,12 @@ def record_bridge_heartbeat(
         "last_valid_reading_at": last_valid_reading_at or "",
         "reading_age_seconds": reading_age_seconds,
         "sequence": sequence,
+        "error_breakdown": error_breakdown,
+        "frame_counts": frame_counts,
+        "reading_counts": reading_counts,
+        "queue_counts": queue_counts,
+        "poll_interval_seconds": poll_interval_seconds,
+        "diagnostics_generated_at": diagnostics_generated_at,
     })
     if health == "CONFIG_ERROR":
         conn.status = STATUS_AWAITING

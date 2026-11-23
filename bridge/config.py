@@ -165,6 +165,7 @@ class BridgeConfig:
     gcs_credentials_path: str
     simulation_interval_seconds: float
     status_refresh_seconds: float
+    diagnostics_poll_interval_seconds: float
     config_errors: tuple[str, ...]
 
     @classmethod
@@ -271,6 +272,13 @@ class BridgeConfig:
             or 2.0,
             status_refresh_seconds=_float("STATUS_REFRESH_SECONDS", errors=errors, default=2.0)
             or 2.0,
+            diagnostics_poll_interval_seconds=_float(
+                "DIAGNOSTICS_POLL_INTERVAL_SECONDS",
+                "POLL_INTERVAL_SECONDS",
+                errors=errors,
+                default=2.0,
+            )
+            or 2.0,
             config_errors=tuple(errors),
         )
 
@@ -298,6 +306,8 @@ class BridgeConfig:
             errors.append("DEVICE_RECONNECT_MAX_SECONDS must be >= DEVICE_RECONNECT_MIN_SECONDS")
         if self.device_stale_after_seconds <= 0:
             errors.append("DEVICE_STALE_AFTER_SECONDS must be greater than zero")
+        if self.diagnostics_poll_interval_seconds <= 0:
+            errors.append("DIAGNOSTICS_POLL_INTERVAL_SECONDS must be greater than zero")
         errors.extend(_serial_errors(self))
         if not self.erp_token and not self.dry_run:
             if not self.erp_username or not self.erp_password:
