@@ -1,7 +1,9 @@
 """Kalika Enterprises ERP - FastAPI application entrypoint."""
 import logging
 import os
+import time
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select, text
 
 from .config import settings
+from .logging_setup import configure_logging
 from .database import Base, engine, check_db_health
 from . import models  # noqa: F401  (register models)
 from .routers import (
@@ -19,6 +22,8 @@ from .routers import (
     material_requirements, fulfilment, stock_flow, quotations, packaging_lists,
     employees, prns, activity_log, sales_prompts, production_records,
 )
+
+_log_uploader = configure_logging()
 
 # Schema additions create_all cannot apply to pre-existing tables (idempotent ALTER).
 _COLUMN_MIGRATIONS = [
@@ -417,8 +422,73 @@ app.add_middleware(
 )
 
 
+def _infer_request_intent(method: str, path: str) -> str:
+    verb = method.upper()
+    if verb == "GET":
+        if path.startswith("/dashboard") or path.endswith("/status") or path == "/health":
+            return "MONITOR"
+        if path.startswith("/reports") or path.startswith("/activity-log"):
+            return "EXPORT"
+        return "READ"
+    if verb in ("POST", "PUT", "PATCH"):
+        if path.startswith("/auth"):
+            return "AUTHORIZE"
+        if path.startswith("/production/machine"):
+            return "INTEGRATE"
+        if path.startswith("/alerts"):
+            return "RESPOND"
+        return "EXECUTE"
+    if verb == "DELETE":
+        return "REMOVE"
+    return verb
+
+
+@app.middleware("http")
+async def durable_request_logging(request: Request, call_next):
+    if request.url.path.startswith("/assets/"):
+        return await call_next(request)
+    started = time.perf_counter()
+    request_id = request.headers.get("x-request-id") or uuid4().hex[:12]
+    response = None
+    user = getattr(request.state, "user", None)
+    user_id = str(getattr(user, "id", "") or "")
+    user_role = str(getattr(getattr(user, "role", None), "value", "") or "")
+    extra = {
+        "event": "http.request",
+        "component": "http",
+        "request_id": request_id,
+        "http_method": request.method,
+        "http_path": request.url.path,
+        "user_id": user_id,
+        "user_role": user_role,
+        "medium": "HTTP_API",
+        "intent": _infer_request_intent(request.method, request.url.path),
+        "user_class": user_role or "anonymous",
+    }
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception as exc:
+        extra.update({
+            "event": "http.request.failed",
+            "http_status": 500,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 2),
+            "error_code": type(exc).__name__,
+            "error_message": str(exc)[:500],
+        })
+        log.exception("http.request.failed", extra=extra)
+        raise
+    finally:
+        if response is not None:
+            extra["http_status"] = response.status_code
+            extra["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            log.info("http.request", extra=extra)
+
+
 @app.on_event("startup")
 def on_startup():
+    _log_uploader.start()
     log.info("Kalika ERP v%s starting …", settings.APP_VERSION)
     if _FRONTEND_DIST is not None:
         log.info("Frontend dist resolved to: %s", _FRONTEND_DIST)
@@ -508,6 +578,12 @@ def on_startup():
             log.info("Purchase shortage sync on startup: %s", r)
     except Exception as exc:
         log.error("startup shortage sync failed (recoverable): %s", exc)
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    _log_uploader.stop()
+    log.info("Kalika ERP logging stopped.")
 
 
 @app.get("/", include_in_schema=False)

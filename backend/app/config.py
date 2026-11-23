@@ -11,6 +11,7 @@ class Settings(BaseSettings):
 
     APP_NAME: str = "Kalika Enterprises ERP"
     APP_VERSION: str = "1.0.0"
+    APP_ENV: str = "production"
     DEBUG: bool = False
     API_PREFIX: str = "/api"
 
@@ -47,6 +48,16 @@ class Settings(BaseSettings):
     KALIFLOW_CACHE_SECONDS: int = 300
     GOOGLE_APPLICATION_CREDENTIALS: str | None = None
     REPORT_DIR: Path = BASE_DIR / "reports"
+
+    # ---- Durable logging ----
+    LOG_DIR: Path = Path("data/logs")
+    LOG_FILE_NAME: str = "kalika-erp.jsonl"
+    LOG_LEVEL: str = "INFO"
+    LOG_MAX_BYTES: int = 10 * 1024 * 1024
+    LOG_BACKUP_COUNT: int = 10
+    GCS_LOG_UPLOAD_ENABLED: bool = True
+    GCS_LOG_PREFIX: str = "Kalika_inventory/Logs"
+    GCS_LOG_UPLOAD_INTERVAL_SECONDS: int = 60
 
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 

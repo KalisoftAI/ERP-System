@@ -138,6 +138,13 @@ DB_SECRET=${DB_SECRET},\
 REPORT_DIR=/app/reports,\
 GCS_BUCKET=kalisoftai-datahub,\
 GCS_EXCEL_FILE=Kalika_inventory/Daily Report Aug-26.xlsx,\
+APP_ENV=production,\
+LOG_DIR=/app/data/logs,\
+LOG_FILE_NAME=kalika-erp.jsonl,\
+LOG_LEVEL=INFO,\
+GCS_LOG_UPLOAD_ENABLED=True,\
+GCS_LOG_PREFIX=Kalika_inventory/Logs,\
+GCS_LOG_UPLOAD_INTERVAL_SECONDS=60,\
 MAIL_ENABLED=${MAIL_ENABLED},\
 MAIL_USERNAME=${MAIL_USERNAME:-kalikaenterprises@gmail.com},\
 MAIL_FROM=${MAIL_FROM:-kalikaenterprises@gmail.com}" \
@@ -150,10 +157,10 @@ if [[ -n "$RUNNER_SA" ]]; then
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${RUNNER_SA}" \
     --role="roles/cloudsql.client" --condition=None >/dev/null 2>&1 || echo "  (iam binding may need manual grant)"
-  echo "🔐 Ensuring ${RUNNER_SA} has roles/storage.objectViewer"
+  echo "🔐 Ensuring ${RUNNER_SA} has roles/storage.objectAdmin for durable logs"
   gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
     --member="serviceAccount:${RUNNER_SA}" \
-    --role="roles/storage.objectViewer" --condition=None >/dev/null 2>&1 || echo "  (storage role may need manual grant)"
+    --role="roles/storage.objectAdmin" --condition=None >/dev/null 2>&1 || echo "  (storage role may need manual grant)"
 fi
 
 # Ensure 100% traffic always goes to the newest revision (avoids stale traffic pinning)

@@ -36,7 +36,7 @@ ENV PORT=8080
 
 # Non-root user (Cloud Run requirement)
 RUN useradd --create-home --shell /bin/bash appuser \
-    && mkdir -p /app/reports /app/data \
+    && mkdir -p /app/reports /app/data /app/data/logs \
     && chown -R appuser:appuser /app
 USER appuser
 
