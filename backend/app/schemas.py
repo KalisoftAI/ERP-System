@@ -1425,3 +1425,76 @@ class PRNFulfillmentIn(BaseModel):
     fulfillment_status: Literal["Pending", "Partially Fulfilled", "Completed"]
     purchase_reference: str = Field(default="", max_length=120)
     purchase_remarks: str = Field(default="", max_length=4000)
+
+
+# ------------------------- Production Records (weighing machine) -------------------------
+class TareWeightSettingIn(BaseModel):
+    size: str = Field(min_length=1, max_length=60)
+    tare_weight: float = Field(gt=0)
+    uom: str = Field(default="kg", max_length=20)
+    notes: str = ""
+
+    @field_validator("size", mode="before")
+    @classmethod
+    def _strip_size(cls, v):
+        return " ".join(str(v or "").split()).strip()
+
+
+class TareWeightSettingUpdate(BaseModel):
+    size: Optional[str] = Field(default=None, min_length=1, max_length=60)
+    tare_weight: Optional[float] = Field(default=None, gt=0)
+    uom: Optional[str] = Field(default=None, max_length=20)
+    is_active: Optional[bool] = None
+    notes: Optional[str] = None
+
+
+class WeighingTransactionIn(BaseModel):
+    """Standard internal weighing transaction schema.
+
+    One weighing event as printed on the machine packing slip: Product, Size,
+    Grade, Micron, Production Date, Box Number, Barcode, Gross Weight, Remark.
+    `transaction_id` is the machine's own unique transaction reference when it
+    provides one; the barcode is used as the dedupe anchor otherwise. The ERP
+    never sends anything back to the machine — this schema is receive-only.
+    """
+
+    product_id: Optional[int] = None
+    product: str = Field(default="", max_length=500)   # product/model text from the machine
+    item_code: str = Field(default="", max_length=120)
+    size: str = Field(min_length=1, max_length=60)
+    grade: str = Field(default="", max_length=60)
+    micron: str = Field(default="", max_length=30)
+    production_date: date = Field(default_factory=date.today)
+    box_number: str = Field(min_length=1, max_length=60)
+    barcode: Optional[str] = Field(default=None, max_length=160)
+    gross_weight: float = Field(gt=0)
+    remark: str = ""
+    transaction_id: Optional[str] = Field(default=None, max_length=120)
+    machine_id: str = Field(default="", max_length=80)
+
+    @field_validator("product", "item_code", "size", "grade", "micron", "box_number", mode="before")
+    @classmethod
+    def _strip_text(cls, v):
+        return str(v).strip() if v is not None and not isinstance(v, str) else (v or "").strip()
+
+    @field_validator("barcode", "transaction_id", mode="before")
+    @classmethod
+    def _blank_to_none(cls, v):
+        s = (v or "").strip() if isinstance(v, str) else v
+        return s or None
+
+
+class MachineConfigIn(BaseModel):
+    """Connection configuration placeholder. `config` carries transport
+    parameters (com_port, baud_rate, ip_address, tcp_port, api_endpoint, …)
+    supplied later by the machine technician; nothing here opens a connection."""
+
+    name: str = Field(default="Weighing Machine 1", min_length=1, max_length=120)
+    connection_type: str = Field(default="NONE", max_length=30)
+    config: dict = {}
+    notes: str = ""
+
+    @field_validator("connection_type", mode="before")
+    @classmethod
+    def _upper_type(cls, v):
+        return str(v or "NONE").strip().upper()

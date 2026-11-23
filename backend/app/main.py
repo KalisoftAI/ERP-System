@@ -17,7 +17,7 @@ from .routers import (
     purchases, inventory, production, orders, dispatch, plans, dashboard, kaliflow, reports,
     requirements, salespersons, local_orders, bom, alerts,
     material_requirements, fulfilment, stock_flow, quotations, packaging_lists,
-    employees, prns, activity_log, sales_prompts,
+    employees, prns, activity_log, sales_prompts, production_records,
 )
 
 # Schema additions create_all cannot apply to pre-existing tables (idempotent ALTER).
@@ -538,6 +538,9 @@ app.include_router(plants.router)
 app.include_router(raw_materials.router)
 app.include_router(purchases.router)
 app.include_router(inventory.router)
+# production_records shares /production and must be registered before the
+# existing /production/{order_id} routes so static paths match first.
+app.include_router(production_records.router)
 app.include_router(production.router)
 app.include_router(orders.router)
 app.include_router(dispatch.router)

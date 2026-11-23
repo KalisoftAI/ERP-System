@@ -1245,3 +1245,128 @@ class PRNLine(Base):
     prn: Mapped[PRN] = relationship(back_populates="lines")
     material: Mapped[Product | None] = relationship()
     plant: Mapped[Plant | None] = relationship()
+
+
+# ---------------------------------------------------------------------------
+# Production Records (box-wise) + Weighing Machine integration (additive)
+# ---------------------------------------------------------------------------
+class TareWeightSetting(Base):
+    """Configured Less/Tare weight per Size (e.g. "400mm" -> 5 kg).
+
+    The applied tare is copied onto each ProductionRecord at capture time, so
+    editing a setting later NEVER changes historical Net Weight calculations.
+    """
+
+    __tablename__ = "tare_weight_settings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    size: Mapped[str] = mapped_column(String(60), unique=True, index=True)
+    tare_weight: Mapped[float] = mapped_column(Float, default=0)
+    uom: Mapped[str] = mapped_column(String(20), default="kg")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    notes: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_by: Mapped[str] = mapped_column(String(160), default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class MachineConnection(Base):
+    """Weighing-machine connection configuration placeholder.
+
+    Records HOW a machine will connect (RS232 / USB serial / TCP-IP / vendor
+    API) without performing any live communication. Status is informational
+    only: AWAITING_CONFIGURATION (default) / CONNECTED / DISCONNECTED. No COM
+    port, baud rate, IP address or protocol is assumed — those details are
+    expected from the machine technician before a real adapter is enabled.
+    """
+
+    __tablename__ = "machine_connections"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), default="Weighing Machine 1")
+    connection_type: Mapped[str] = mapped_column(String(30), default="NONE", index=True)
+    # NONE | RS232 | USB_SERIAL | TCP_IP | VENDOR_API | SIMULATION
+    status: Mapped[str] = mapped_column(String(30), default="AWAITING_CONFIGURATION", index=True)
+    # AWAITING_CONFIGURATION | CONNECTED | DISCONNECTED
+    config_json: Mapped[str] = mapped_column(Text, default="")
+    notes: Mapped[str] = mapped_column(Text, default="")
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class WeighingTransaction(Base):
+    """Raw inbox row for one weighing event (machine / simulation / manual).
+
+    The transaction is the dedupe anchor: `transaction_uid` is unique. Every
+    received payload is logged here first with a status so failures and
+    duplicate deliveries are auditable and never silently dropped.
+    """
+
+    __tablename__ = "weighing_transactions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transaction_uid: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    machine_id: Mapped[str] = mapped_column(String(80), default="", index=True)
+    source: Mapped[str] = mapped_column(String(30), default="MACHINE_API", index=True)
+    # MACHINE_API | SIMULATION | MANUAL
+    barcode: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    box_number: Mapped[str] = mapped_column(String(60), default="")
+    raw_payload: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="RECEIVED", index=True)
+    # RECEIVED | PROCESSED | DUPLICATE | FAILED
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    duplicate_count: Mapped[int] = mapped_column(Integer, default=0)
+    production_record_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ProductionRecord(Base):
+    """One weighed box (packing-slip equivalent) stored permanently.
+
+    Independent of ProductionOrder/ProductionMovement by design: the weighing
+    machine workflow has no customer/sales-order context. Finished-goods stock
+    is posted exactly once per record as a `stock_movements` row with
+    ref_type='production_record' (see inventory_sync_status +
+    inventory_movement_id for traceability).
+    """
+
+    __tablename__ = "production_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    box_number: Mapped[str] = mapped_column(String(60), index=True)
+    barcode: Mapped[str | None] = mapped_column(String(160), unique=True, nullable=True, index=True)
+    product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), index=True)
+    product_name: Mapped[str] = mapped_column(String(500), default="")
+    size: Mapped[str] = mapped_column(String(60), default="", index=True)
+    grade: Mapped[str] = mapped_column(String(60), default="")
+    micron: Mapped[str] = mapped_column(String(30), default="")
+    production_date: Mapped[date] = mapped_column(Date, index=True, default=date.today)
+    gross_weight: Mapped[float] = mapped_column(Float, default=0)
+    # Applied tare snapshot (NULL = not configured yet — record kept, clearly flagged)
+    tare_weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    tare_weight_setting_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tare_weight_settings.id"), nullable=True
+    )
+    net_weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    remark: Mapped[str] = mapped_column(Text, default="")
+    machine_transaction_id: Mapped[int | None] = mapped_column(
+        ForeignKey("weighing_transactions.id"), nullable=True, index=True
+    )
+    inventory_movement_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    inventory_sync_status: Mapped[str] = mapped_column(String(20), default="PENDING", index=True)
+    # PENDING | SYNCED | FAILED (records without a net weight stay PENDING)
+    inventory_sync_error: Mapped[str] = mapped_column(Text, default="")
+    created_by: Mapped[str] = mapped_column(String(160), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    product: Mapped[Product] = relationship()
+    tare_setting: Mapped[TareWeightSetting | None] = relationship()
+    transaction: Mapped[WeighingTransaction | None] = relationship()
