@@ -1301,6 +1301,23 @@ class MachineConnection(Base):
     )
 
 
+class MachineRawFrame(Base):
+    __tablename__ = "machine_raw_frames"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    device_host: Mapped[str] = mapped_column(String(120), default="", index=True)
+    device_port: Mapped[int] = mapped_column(Integer, default=0)
+    machine_id: Mapped[str] = mapped_column(String(80), default="", index=True)
+    raw_text: Mapped[str] = mapped_column(Text, default="")
+    raw_hex: Mapped[str] = mapped_column(Text, default="")
+    parser_status: Mapped[str] = mapped_column(String(30), default="RAW", index=True)
+    barcode: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    gross_weight: Mapped[float | None] = mapped_column(Float, nullable=True)
+    transaction_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
 class WeighingTransaction(Base):
     """Raw inbox row for one weighing event (machine / simulation / manual).
 

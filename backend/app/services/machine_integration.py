@@ -42,6 +42,18 @@ STATUS_CONNECTED = "CONNECTED"
 STATUS_DISCONNECTED = "DISCONNECTED"
 CONNECTION_STATUSES = (STATUS_AWAITING, STATUS_CONNECTED, STATUS_DISCONNECTED)
 
+BRIDGE_HEALTH_STATUSES = (
+    "CONFIG_ERROR",
+    "DISCONNECTED",
+    "CONNECTING",
+    "CONNECTED_NO_DATA",
+    "RECEIVING_UNPARSED",
+    "CONNECTED_STALE",
+    "UNSTABLE",
+    "STABLE",
+    "DEVICE_ERROR",
+)
+
 # Config keys the technician is expected to fill in later, per transport.
 CONFIG_PLACEHOLDERS: dict[str, tuple[str, ...]] = {
     "RS232": (
@@ -235,6 +247,74 @@ def mark_seen(db: Session, conn: MachineConnection) -> None:
     """Update last_seen_at when a transaction arrives through any channel."""
     conn.last_seen_at = datetime.utcnow()
     db.commit()
+
+
+def record_bridge_heartbeat(
+    db: Session,
+    *,
+    status: str,
+    health_status: str,
+    device_id: str,
+    device_mac: str,
+    device_host: str,
+    device_port: int,
+    parser_mode: str,
+    dry_run: bool | None,
+    gcs_upload_enabled: bool | None,
+    error_message: str,
+    last_barcode: str | None,
+    last_gross_weight: float | None,
+    last_byte_at: str | None,
+    last_valid_reading_at: str | None,
+    reading_age_seconds: float | None,
+    sequence: int,
+) -> MachineConnection:
+    conn = get_or_create_connection(db)
+    try:
+        config = json.loads(conn.config_json) if conn.config_json else {}
+    except (TypeError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    normalized = (status or "").strip().upper()
+    health = (health_status or normalized or "DISCONNECTED").strip().upper()
+    config.update({
+        "health_status": health,
+        "device_id": device_id,
+        "device_mac": device_mac,
+        "device_host": device_host,
+        "device_port": device_port,
+        "parser_mode": parser_mode,
+        "dry_run": dry_run,
+        "gcs_upload_enabled": gcs_upload_enabled,
+        "last_barcode": last_barcode or "",
+        "last_gross_weight": last_gross_weight,
+        "last_byte_at": last_byte_at or "",
+        "last_valid_reading_at": last_valid_reading_at or "",
+        "reading_age_seconds": reading_age_seconds,
+        "sequence": sequence,
+    })
+    if health == "CONFIG_ERROR":
+        conn.status = STATUS_AWAITING
+    elif health in {
+        "CONNECTED",
+        "LISTENING",
+        "SIMULATING",
+        "CONNECTED_NO_DATA",
+        "RECEIVING_UNPARSED",
+        "CONNECTED_STALE",
+        "UNSTABLE",
+        "STABLE",
+    }:
+        conn.status = STATUS_CONNECTED
+    else:
+        conn.status = STATUS_DISCONNECTED
+    conn.config_json = json.dumps(config)
+    conn.last_seen_at = datetime.utcnow()
+    conn.last_error = (error_message or "")[:2000]
+    db.commit()
+    db.refresh(conn)
+    return conn
 
 
 # ---------------------------------------------------------------------------

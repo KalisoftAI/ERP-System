@@ -1498,3 +1498,59 @@ class MachineConfigIn(BaseModel):
     @classmethod
     def _upper_type(cls, v):
         return str(v or "NONE").strip().upper()
+
+
+class MachineFrameIn(BaseModel):
+    raw_text: str = Field(default="", max_length=8000)
+    raw_hex: str = Field(default="", max_length=20000)
+    device_id: str = Field(default="", max_length=80)
+    device_host: str = Field(default="", max_length=120)
+    device_port: int = Field(default=0, ge=0, le=65535)
+    machine_id: str = Field(default="", max_length=80)
+    parser_status: str = Field(default="RAW", max_length=30)
+    health_status: str = Field(default="", max_length=30)
+    sequence: int = Field(default=0, ge=0)
+    unit: str = Field(default="", max_length=20)
+    is_stable: Optional[bool] = None
+    is_zero: Optional[bool] = None
+    is_overload: Optional[bool] = None
+    last_byte_at: Optional[str] = Field(default=None, max_length=60)
+    last_valid_reading_at: Optional[str] = Field(default=None, max_length=60)
+    barcode: Optional[str] = Field(default=None, max_length=160)
+    gross_weight: Optional[float] = Field(default=None, ge=0)
+    transaction_id: Optional[str] = Field(default=None, max_length=120)
+    error_message: str = Field(default="", max_length=2000)
+
+    @field_validator("parser_status", mode="before")
+    @classmethod
+    def _upper_status(cls, v):
+        return str(v or "RAW").strip().upper()
+
+    @field_validator("health_status", mode="before")
+    @classmethod
+    def _upper_frame_health(cls, v):
+        return str(v or "").strip().upper()
+
+
+class MachineHeartbeatIn(BaseModel):
+    status: str = Field(min_length=1, max_length=30)
+    health_status: str = Field(default="", max_length=30)
+    device_id: str = Field(default="", max_length=80)
+    device_mac: str = Field(default="", max_length=30)
+    device_host: str = Field(default="", max_length=120)
+    device_port: int = Field(default=0, ge=0, le=65535)
+    parser_mode: str = Field(default="", max_length=30)
+    dry_run: Optional[bool] = None
+    gcs_upload_enabled: Optional[bool] = None
+    error_message: str = Field(default="", max_length=2000)
+    last_barcode: Optional[str] = Field(default=None, max_length=160)
+    last_gross_weight: Optional[float] = Field(default=None, ge=0)
+    last_byte_at: Optional[str] = Field(default=None, max_length=60)
+    last_valid_reading_at: Optional[str] = Field(default=None, max_length=60)
+    reading_age_seconds: Optional[float] = Field(default=None, ge=0)
+    sequence: int = Field(default=0, ge=0)
+
+    @field_validator("status", "health_status", mode="before")
+    @classmethod
+    def _upper_heartbeat_status(cls, v):
+        return str(v or "DISCONNECTED").strip().upper()

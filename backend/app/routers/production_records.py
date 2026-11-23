@@ -28,9 +28,12 @@ from ..auth import CurrentUser, AllStaff, ManagerOrAdmin
 from ..crud import get_or_404, write_audit
 from ..database import get_db
 from ..models import (
-    ProductionRecord, TareWeightSetting, WeighingTransaction,
+    MachineRawFrame, ProductionRecord, TareWeightSetting, WeighingTransaction,
 )
-from ..schemas import MachineConfigIn, TareWeightSettingIn, TareWeightSettingUpdate, WeighingTransactionIn
+from ..schemas import (
+    MachineConfigIn, MachineFrameIn, MachineHeartbeatIn, TareWeightSettingIn,
+    TareWeightSettingUpdate, WeighingTransactionIn,
+)
 from ..services import machine_integration as mi
 from ..services import weighing_service as ws
 
@@ -83,6 +86,23 @@ def _serialize_txn(t: WeighingTransaction) -> dict:
         "production_record_id": t.production_record_id,
         "received_at": t.received_at,
         "processed_at": t.processed_at,
+    }
+
+
+def _serialize_frame(f: MachineRawFrame) -> dict:
+    return {
+        "id": f.id,
+        "device_host": f.device_host,
+        "device_port": f.device_port,
+        "machine_id": f.machine_id,
+        "raw_text": f.raw_text,
+        "raw_hex": f.raw_hex,
+        "parser_status": f.parser_status,
+        "barcode": f.barcode or "",
+        "gross_weight": f.gross_weight,
+        "transaction_id": f.transaction_id or "",
+        "error_message": f.error_message or "",
+        "created_at": f.created_at,
     }
 
 
@@ -216,8 +236,29 @@ def machine_status(db: Annotated[Session, Depends(get_db)], _: CurrentUser):
     last_record = db.scalars(
         select(ProductionRecord).order_by(ProductionRecord.created_at.desc()).limit(1)
     ).first()
+    frame_counts = dict(
+        db.execute(
+            select(MachineRawFrame.parser_status, func.count())
+            .group_by(MachineRawFrame.parser_status)
+        ).all()
+    )
+    frames_today = db.scalar(
+        select(func.count()).select_from(MachineRawFrame)
+        .where(MachineRawFrame.created_at >= today_start)
+    ) or 0
+    last_frame = db.scalars(
+        select(MachineRawFrame).order_by(MachineRawFrame.created_at.desc(), MachineRawFrame.id.desc()).limit(1)
+    ).first()
+    try:
+        bridge_config = json.loads(conn.config_json) if conn.config_json else {}
+    except (TypeError, ValueError):
+        bridge_config = {}
+    if not isinstance(bridge_config, dict):
+        bridge_config = {}
     return {
         "connection": mi.serialize_connection(conn),
+        "device_health": bridge_config.get("health_status") or conn.status,
+        "health_statuses": list(mi.BRIDGE_HEALTH_STATUSES),
         "counters": {
             "received_today": received_today,
             "processed": counts.get(ws.TXN_PROCESSED, 0),
@@ -225,14 +266,20 @@ def machine_status(db: Annotated[Session, Depends(get_db)], _: CurrentUser):
             "duplicate": counts.get(ws.TXN_DUPLICATE, 0),
             "total": sum(counts.values()),
         },
+        "frames": {
+            "received_today": frames_today,
+            "total": sum(frame_counts.values()),
+            "parsed": frame_counts.get("PARSED", 0),
+            "raw": frame_counts.get("RAW", 0),
+            "errors": frame_counts.get("ERROR", 0),
+        },
         "last_transaction": _serialize_txn(last_txn) if last_txn else None,
         "last_record": _serialize_record(last_record) if last_record else None,
+        "last_frame": _serialize_frame(last_frame) if last_frame else None,
         "integration_note": (
-            "Preparation only — no live machine communication. Real transport "
-            "(RS232 / USB Serial / TCP-IP / vendor API) is enabled after the "
-            "machine technician provides the machine model, protocol, port "
-            "details and sample data format. SIMULATION mode demonstrates the "
-            "receiving workflow without a real machine."
+            "Machine data is received through the Windows bridge. Raw frames, "
+            "heartbeats and parsed transactions are stored here; ERP validation, "
+            "tare, dedupe, production records and stock posting stay server-side."
         ),
     }
 
@@ -251,6 +298,90 @@ def save_machine_config(body: MachineConfigIn, db: Annotated[Session, Depends(ge
     write_audit(db, user, "UPDATE", "machine_connections", conn.id,
                 f"Saved machine connection config ({conn.connection_type})")
     return mi.serialize_connection(conn)
+
+
+@router.post("/machine/heartbeat", response_model=dict)
+def receive_machine_heartbeat(
+    body: MachineHeartbeatIn,
+    db: Annotated[Session, Depends(get_db)],
+    _: CurrentUser,
+):
+    conn = mi.record_bridge_heartbeat(
+        db,
+        status=body.status,
+        health_status=body.health_status,
+        device_id=body.device_id,
+        device_mac=body.device_mac,
+        device_host=body.device_host,
+        device_port=body.device_port,
+        parser_mode=body.parser_mode,
+        dry_run=body.dry_run,
+        gcs_upload_enabled=body.gcs_upload_enabled,
+        error_message=body.error_message,
+        last_barcode=body.last_barcode,
+        last_gross_weight=body.last_gross_weight,
+        last_byte_at=body.last_byte_at,
+        last_valid_reading_at=body.last_valid_reading_at,
+        reading_age_seconds=body.reading_age_seconds,
+        sequence=body.sequence,
+    )
+    return mi.serialize_connection(conn)
+
+
+@router.post("/machine/frames", response_model=dict, status_code=status.HTTP_201_CREATED)
+def receive_machine_frame(
+    body: MachineFrameIn,
+    db: Annotated[Session, Depends(get_db)],
+    _: CurrentUser,
+):
+    frame = MachineRawFrame(
+        device_host=body.device_host,
+        device_port=body.device_port,
+        machine_id=body.machine_id,
+        raw_text=body.raw_text,
+        raw_hex=body.raw_hex,
+        parser_status=body.parser_status,
+        barcode=body.barcode,
+        gross_weight=body.gross_weight,
+        transaction_id=body.transaction_id,
+        error_message=body.error_message,
+    )
+    db.add(frame)
+    db.commit()
+    db.refresh(frame)
+    return _serialize_frame(frame)
+
+
+@router.get("/machine/frames", response_model=dict)
+def list_machine_frames(
+    db: Annotated[Session, Depends(get_db)], _: CurrentUser,
+    parser_status: str = "",
+    search: str = "",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+):
+    stmt = select(MachineRawFrame)
+    if parser_status:
+        stmt = stmt.where(MachineRawFrame.parser_status == parser_status.upper())
+    if search:
+        like = f"%{search}%"
+        stmt = stmt.where(or_(
+            MachineRawFrame.raw_text.ilike(like),
+            MachineRawFrame.barcode.ilike(like),
+            MachineRawFrame.transaction_id.ilike(like),
+            MachineRawFrame.error_message.ilike(like),
+        ))
+    total = db.scalar(select(func.count()).select_from(stmt.subquery()))
+    rows = db.scalars(
+        stmt.order_by(MachineRawFrame.created_at.desc(), MachineRawFrame.id.desc())
+        .offset((page - 1) * page_size).limit(page_size)
+    ).all()
+    return {
+        "items": [_serialize_frame(f) for f in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 @router.post("/machine/scan", response_model=dict)

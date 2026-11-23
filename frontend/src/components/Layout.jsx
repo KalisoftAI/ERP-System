@@ -5,7 +5,7 @@ import {
   Truck, Users, Package, FileDown, ShieldCheck, LogOut, ListChecks,
   AlertTriangle, Store, BellRing, ClipboardList, GitBranch, LayoutGrid,
   ChevronsLeft, ChevronsRight, Menu, X, Layers, ArrowLeftRight, FileSpreadsheet, PackagePlus,
-  FileText, Briefcase, ClipboardCheck, History,
+  FileText, Briefcase, ClipboardCheck, History, Radio,
 } from 'lucide-react'
 import api from '../lib/api'
 import { useAuth } from '../context/AuthContext'
@@ -28,6 +28,7 @@ const SECTIONS = [
     items: [
       { to: '/dispatch', label: 'Dispatch', icon: Truck },
       { to: '/production', label: 'Production', icon: Factory },
+      { to: '/machine-bridge', label: 'Machine Bridge', icon: Radio },
       { to: '/local-orders', label: 'Local Orders', icon: Store },
       { to: '/pending-po', label: 'Pending PO', icon: ListChecks },
       { to: '/packaging-lists', label: 'Packaging List', icon: Package },
@@ -81,6 +82,7 @@ const TITLE_MAP = {
   '/packaging-lists': { title: 'Packaging List', sub: 'Box-wise packing weights' },
   '/dispatch': { title: 'Dispatch', sub: 'Customer-wise dispatch tracking' },
   '/production': { title: 'Production', sub: 'Schedule, actual output & reports' },
+  '/machine-bridge': { title: 'Machine Bridge', sub: 'Serial feed, raw frames and ERP inbox' },
   '/local-orders': { title: 'Local Orders', sub: 'Local orders & plans' },
   '/pending-po': { title: 'Pending PO', sub: 'Order fulfilment ledger' },
   '/raw-materials': { title: 'Raw Materials', sub: 'Polymer position & balances' },

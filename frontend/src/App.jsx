@@ -27,6 +27,7 @@ import StockMovements from './pages/StockMovements'
 import PackagingList from './pages/PackagingList'
 import Employees from './pages/Employees'
 import ActivityLog from './pages/ActivityLog'
+import MachineBridge from './pages/MachineBridge'
 
 function RequireAuth({ children }) {
   const { user } = useAuth()
@@ -73,6 +74,7 @@ function App() {
             <Route path="reports" element={<Reports />} />
             <Route path="users" element={<Users />} />
             <Route path="activity-log" element={<ActivityLog />} />
+            <Route path="machine-bridge" element={<MachineBridge />} />
           </Route>
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
