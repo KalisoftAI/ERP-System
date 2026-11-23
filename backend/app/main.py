@@ -17,7 +17,7 @@ from .routers import (
     purchases, inventory, production, orders, dispatch, plans, dashboard, kaliflow, reports,
     requirements, salespersons, local_orders, bom, alerts,
     material_requirements, fulfilment, stock_flow, quotations, packaging_lists,
-    employees, prns, activity_log,
+    employees, prns, activity_log, sales_prompts,
 )
 
 # Schema additions create_all cannot apply to pre-existing tables (idempotent ALTER).
@@ -544,6 +544,7 @@ app.include_router(dispatch.router)
 app.include_router(plans.router)
 app.include_router(dashboard.router)
 app.include_router(kaliflow.router)
+app.include_router(sales_prompts.router)
 app.include_router(reports.router)
 app.include_router(requirements.router)
 app.include_router(salespersons.router)
